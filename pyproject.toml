@@ -9,7 +9,7 @@ description = "A GPU-accelerated ray tracer for gradient-index and polarization 
 readme = "README.md"
 license = {file = "LICENSE"}
 authors = [
-    {name = "Your Name", email = "your.email@example.com"}
+    {name = "Gang Wang", email = "gwangforward@gmail.com"}
 ]
 requires-python = ">=3.8"
 dependencies = [
@@ -26,9 +26,9 @@ classifiers = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/YOUR_USERNAME/GeoRay"
-Documentation = "https://github.com/YOUR_USERNAME/GeoRay/blob/main/README.md"
-Repository = "https://github.com/YOUR_USERNAME/GeoRay"
+Homepage = "https://github.com/gwangcode/georay"
+Documentation = "https://github.com/gwangcode/georay/blob/main/README.md"
+Repository = "https://github.com/gwangcode/georay"
 
 [tool.setuptools.packages.find]
 include = ["georay*"]
