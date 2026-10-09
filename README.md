@@ -78,7 +78,7 @@ print(f"Energy conserved: {out['energy_conserved']}")
 print(f"Output shape: {out['positions'].shape}")
 ```
 
-# Output Description
+## Output Description
 ```tracer.trace(rays, ...)``` returns a Python ```dict``` of PyTorch tensors containing the full history of every ray. Let $N$ be the number of rays and $S$ the number of recorded steps (initial state + each propagation step). All tensors are on the same device as the input rays.
 
 |Key	|Shape	|Dtype	|Description|
@@ -98,7 +98,7 @@ print(f"Output shape: {out['positions'].shape}")
 |rk_error	|[N, S+1]	|float32	|Local truncation error estimate from the adaptive RK4 integrator.|
 |ds_history	|[N, S+1]	|float32	|Step size used at each step (adaptively adjusted per ray).|
 |energy_conserved	|bool	|—	|True if every ray satisfies 0 ≤ energy ≤ 1 at every step.|
-## Common access patterns
+### Common access patterns
 ```python
 # Final position of every ray
 final_positions = out["positions"][:, -1, :]           # [N, 3]
@@ -116,10 +116,10 @@ n2_hist = out["n2"][:, :, 0]
 # Check for internal interfaces (e.g. material A → material B)
 internal = (n1_hist > 1.0) & (n2_hist > 1.0) & (n1_hist != n2_hist)
 ```
-## Export Utilities
+### Export Utilities
 GeoRay ships with two exporters that accept the output dict directly.
 
-### NPZ — full trace history (NumPy binary)
+#### NPZ — full trace history (NumPy binary)
 ```python
 from georay import save_trace_output_to_npz
 
@@ -144,7 +144,7 @@ trace.npz
 ├── rk_error            [N, S+1]
 └── ds_history          [N, S+1]
 ```
-#### Load it back:
+##### Load it back:
 
 ```python
 import numpy as np
@@ -154,7 +154,7 @@ stokes    = data["stokes"]      # ndarray [N, S+1, 4]
 ```
 **Use case:** post-processing, plotting, or statistical analysis in NumPy / SciPy / Pandas.
 
-### STL — 3D ray tracks (mesh file)
+#### STL — 3D ray tracks (mesh file)
 ```python
 from georay import export_ray_history_to_stl
 
