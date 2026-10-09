@@ -40,7 +40,7 @@ Trimesh >= 3.20
 
 GPU is optional but recommended for large scenes.
 
-Quick Start
+## Quick Start
 ```python
 import torch
 import trimesh
