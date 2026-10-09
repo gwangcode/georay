@@ -185,11 +185,11 @@ No wavelength-dependent dispersion inside GRIN fields (user must supply n(λ)).
 If you use GeoRay in your research, please cite:
 
 ```bibtex
-@article{yourname2025georay,
+@article{yourname2026georay,
   title   = {GeoRay: A GPU-Accelerated Ray Tracer for Gradient-Index and Polarization Optics},
   author  = {Gang Wang},
   journal = {Journal of Data- and Knowledge-Integrated Simulation Science},
-  year    = {2025},
+  year    = {2026},
   doi     = {10.5281/zenodo.22983753}
 }
 ```
