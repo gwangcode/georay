@@ -4,7 +4,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python](https://img.shields.io/badge/python-3.8%2B-blue)](https://www.python.org/)
 [![PyTorch](https://img.shields.io/badge/PyTorch-2.0%2B-red)](https://pytorch.org/)
-[![Tests](https://github.com/gwangcode/georay/actions/workflows/test.yml/badge.svg)](https://github.com/gwangcode/georay/actions/workflows/test.yml)
+[![Tests](https://github.com/gwangcode/georay/actions/workflows/test.yml/badge.svg?branch=main)](https://github.com/gwangcode/georay/actions/workflows/test.yml)
 
 **GeoRay** is a pure-PyTorch, GPU-accelerated ray tracer supporting gradient-index (GRIN) media and full Stokes polarization tracking.
 
