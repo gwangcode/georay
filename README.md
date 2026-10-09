@@ -120,56 +120,56 @@ internal = (n1_hist > 1.0) & (n2_hist > 1.0) & (n1_hist != n2_hist)
 GeoRay ships with two exporters that accept the output dict directly.
 
 ### NPZ — full trace history (NumPy binary)
-    ```python
-    from georay import save_trace_output_to_npz
-    
-    save_trace_output_to_npz(out, "trace.npz")
-    ```
-    saves every tensor from the output dict as a NumPy array in a single compressed .npz file:
+```python
+from georay import save_trace_output_to_npz
 
-    ```text
-    trace.npz
-    ├── positions           [N, S+1, 3]
-    ├── stokes              [N, S+1, 4]
-    ├── active              [N, S+1]
-    ├── wavelengths         [N, 1]
-    ├── reflectivity        [N, S+1, 1]
-    ├── transmissivity      [N, S+1, 1]
-    ├── absorptivity        [N, S+1, 1]
-    ├── n1                  [N, S+1, 1]
-    ├── n2                  [N, S+1, 1]
-    ├── polarization_deg    [N, S+1, 1]
-    ├── dop                 [N, S+1, 1]
-    ├── energy              [N, S+1]
-    ├── rk_error            [N, S+1]
-    └── ds_history          [N, S+1]
-    ```
+save_trace_output_to_npz(out, "trace.npz")
+```
+saves every tensor from the output dict as a NumPy array in a single compressed .npz file:
+
+```text
+trace.npz
+├── positions           [N, S+1, 3]
+├── stokes              [N, S+1, 4]
+├── active              [N, S+1]
+├── wavelengths         [N, 1]
+├── reflectivity        [N, S+1, 1]
+├── transmissivity      [N, S+1, 1]
+├── absorptivity        [N, S+1, 1]
+├── n1                  [N, S+1, 1]
+├── n2                  [N, S+1, 1]
+├── polarization_deg    [N, S+1, 1]
+├── dop                 [N, S+1, 1]
+├── energy              [N, S+1]
+├── rk_error            [N, S+1]
+└── ds_history          [N, S+1]
+```
 #### Load it back:
 
-    ```python
-    import numpy as np
-    data = np.load("trace.npz")
-    positions = data["positions"]   # ndarray [N, S+1, 3]
-    stokes    = data["stokes"]      # ndarray [N, S+1, 4]
-    ```
-    **Use case:** post-processing, plotting, or statistical analysis in NumPy / SciPy / Pandas.
+```python
+import numpy as np
+data = np.load("trace.npz")
+positions = data["positions"]   # ndarray [N, S+1, 3]
+stokes    = data["stokes"]      # ndarray [N, S+1, 4]
+```
+**Use case:** post-processing, plotting, or statistical analysis in NumPy / SciPy / Pandas.
 
 ### STL — 3D ray tracks (mesh file)
-    ```python
-    from georay import export_ray_history_to_stl
-    
-    export_ray_history_to_stl(out, "ray_tracks.stl", radius=0.02, sides=6)
-    ```
-    saves every ray segment as a small cylinder in a single STL mesh. Parameters:
-    
-    |Argument	|Default	|Description|
-    |:---       |:---       |:---|
-    |filename	|"ray_tracks.stl"	|Output file path.|
-    |radius	|0.02	|Radius of each cylinder (in world units).|
-    |sides	|6	|Number of polygon sides per cylinder cross-section.|
-    **Use case:** visual inspection in MeshLab, Blender, ParaView, or any STL viewer.
-    
-    **Note:** STL is a surface mesh format (no color, no per-ray metadata). For data analysis use NPZ.
+```python
+from georay import export_ray_history_to_stl
+
+export_ray_history_to_stl(out, "ray_tracks.stl", radius=0.02, sides=6)
+```
+saves every ray segment as a small cylinder in a single STL mesh. Parameters:
+
+|Argument	|Default	|Description|
+|:---       |:---       |:---|
+|filename	|"ray_tracks.stl"	|Output file path.|
+|radius	|0.02	|Radius of each cylinder (in world units).|
+|sides	|6	|Number of polygon sides per cylinder cross-section.|
+**Use case:** visual inspection in MeshLab, Blender, ParaView, or any STL viewer.
+
+**Note:** STL is a surface mesh format (no color, no per-ray metadata). For data analysis use NPZ.
 
 ## Examples
 Several runnable demos are provided:
