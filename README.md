@@ -190,7 +190,7 @@ If you use GeoRay in your research, please cite:
   author  = {Gang Wang},
   journal = {Journal of Data- and Knowledge-Integrated Simulation Science},
   year    = {2025},
-  doi     = {10.5281/zenodo.XXXXXXX}
+  doi     = {10.5281/zenodo.22983753}
 }
 ```
 
