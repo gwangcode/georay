@@ -15,7 +15,7 @@ from .sources import generate_rays
 from .io import save_trace_output_to_npz, export_ray_history_to_stl
 
 __version__ = "1.0.0"
-__author__ = "Your Name"
+__author__ = "Gang Wang"
 
 __all__ = [
     "AdvancedRayTracerPBRTGPU",
