@@ -79,25 +79,26 @@ print(f"Output shape: {out['positions'].shape}")
 ```
 
 # Output Description
-```tracer.trace(rays, ...)``` returns a Python ```dict``` of PyTorch tensors containing the full history of every ray. Let N be the number of rays and S the number of recorded steps (initial state + each propagation step). All tensors are on the same device as the input rays.
+```tracer.trace(rays, ...)``` returns a Python ```dict``` of PyTorch tensors containing the full history of every ray. Let $N$ be the number of rays and $S$ the number of recorded steps (initial state + each propagation step). All tensors are on the same device as the input rays.
 
-Key	Shape	Dtype	Description
-positions	[N, S+1, 3]	float32	3D position of each ray at every step, in world coordinates (x, y, z).
-stokes	[N, S+1, 4]	float32	Full Stokes vector (S0, S1, S2, S3) at every step. S0 is normalized to 1 after each scattering event.
-active	[N, S+1]	bool	Whether the ray is still propagating at each step (False after escape or absorption).
-wavelengths	[N, 1]	float32	Wavelength of each ray in nanometers (constant along the trace).
-reflectivity	[N, S+1, 1]	float32	Reflection coefficient at the last surface interaction of each step (0 if no surface was hit).
-transmissivity	[N, S+1, 1]	float32	Transmission coefficient at the last surface interaction of each step.
-absorptivity	[N, S+1, 1]	float32	Absorption coefficient at the last surface interaction of each step.
-n1	[N, S+1, 1]	float32	Refractive index on the incident side of the last surface hit in this step.
-n2	[N, S+1, 1]	float32	Refractive index on the transmitted side of the last surface hit in this step.
-polarization_deg	[N, S+1, 1]	float32	Linear polarization angle (degrees), computed as 0.5 * atan2(S2, S1).
-dop	[N, S+1, 1]	float32	Degree of polarization sqrt(S1² + S2² + S3²) / S0, in [0, 1].
-energy	[N, S+1]	float32	Remaining energy per ray. Starts at 1.0, drops to 0 after absorption.
-rk_error	[N, S+1]	float32	Local truncation error estimate from the adaptive RK4 integrator.
-ds_history	[N, S+1]	float32	Step size used at each step (adaptively adjusted per ray).
-energy_conserved	bool	—	True if every ray satisfies 0 ≤ energy ≤ 1 at every step.
-Common access patterns
+|Key	|Shape	|Dtype	|Description|
+|:---   |:---   |:---   |:--- |
+|positions	|[N, S+1, 3]	|float32    |3D position of each ray at every step, in world coordinates (x, y, z).|
+|stokes	|[N, S+1, 4]	|float32	|Full Stokes vector (S0, S1, S2, S3) at every step. S0 is normalized to 1 after each scattering event.|
+|active	|[N, S+1]	|bool	|Whether the ray is still propagating at each step (False after escape or absorption).|
+|wavelengths	|[N, 1]	|float32	|Wavelength of each ray in nanometers (constant along the trace).|
+|reflectivity	|[N, S+1, 1]	|float32	|Reflection coefficient at the last surface interaction of each step (0 if no surface was hit).|
+|transmissivity	|[N, S+1, 1]	|float32	|Transmission coefficient at the last surface interaction of each step.|
+|absorptivity	|[N, S+1, 1]	|float32	|Absorption coefficient at the last surface interaction of each step.|
+|n1	|[N, S+1, 1]	|float32	|Refractive index on the incident side of the last surface hit in this step.|
+|n2	|[N, S+1, 1]	|float32	|Refractive index on the transmitted side of the last surface hit in this step.|
+|polarization_deg	|[N, S+1, 1]	|float32	|Linear polarization angle (degrees), computed as 0.5 * atan2(S2, S1).|
+|dop	|[N, S+1, 1]	|float32	|Degree of polarization sqrt(S1² + S2² + S3²) / S0, in [0, 1].|
+|energy	|[N, S+1]	|float32	|Remaining energy per ray. Starts at 1.0, drops to 0 after absorption.|
+|rk_error	|[N, S+1]	|float32	|Local truncation error estimate from the adaptive RK4 integrator.|
+|ds_history	|[N, S+1]	|float32	|Step size used at each step (adaptively adjusted per ray).|
+|energy_conserved	|bool	|—	|True if every ray satisfies 0 ≤ energy ≤ 1 at every step.|
+## Common access patterns
 ```python
 # Final position of every ray
 final_positions = out["positions"][:, -1, :]           # [N, 3]
@@ -118,54 +119,57 @@ internal = (n1_hist > 1.0) & (n2_hist > 1.0) & (n1_hist != n2_hist)
 ## Export Utilities
 GeoRay ships with two exporters that accept the output dict directly.
 
-NPZ — full trace history (NumPy binary)
-```python
-from georay import save_trace_output_to_npz
-```
-save_trace_output_to_npz(out, "trace.npz")
-Saves every tensor from the output dict as a NumPy array in a single compressed .npz file:
+### NPZ — full trace history (NumPy binary)
+    ```python
+    from georay import save_trace_output_to_npz
+    
+    save_trace_output_to_npz(out, "trace.npz")
+    ```
+    saves every tensor from the output dict as a NumPy array in a single compressed .npz file:
 
-```text
-trace.npz
-├── positions           [N, S+1, 3]
-├── stokes              [N, S+1, 4]
-├── active              [N, S+1]
-├── wavelengths         [N, 1]
-├── reflectivity        [N, S+1, 1]
-├── transmissivity      [N, S+1, 1]
-├── absorptivity        [N, S+1, 1]
-├── n1                  [N, S+1, 1]
-├── n2                  [N, S+1, 1]
-├── polarization_deg    [N, S+1, 1]
-├── dop                 [N, S+1, 1]
-├── energy              [N, S+1]
-├── rk_error            [N, S+1]
-└── ds_history          [N, S+1]
-```
-Load it back:
+    ```text
+    trace.npz
+    ├── positions           [N, S+1, 3]
+    ├── stokes              [N, S+1, 4]
+    ├── active              [N, S+1]
+    ├── wavelengths         [N, 1]
+    ├── reflectivity        [N, S+1, 1]
+    ├── transmissivity      [N, S+1, 1]
+    ├── absorptivity        [N, S+1, 1]
+    ├── n1                  [N, S+1, 1]
+    ├── n2                  [N, S+1, 1]
+    ├── polarization_deg    [N, S+1, 1]
+    ├── dop                 [N, S+1, 1]
+    ├── energy              [N, S+1]
+    ├── rk_error            [N, S+1]
+    └── ds_history          [N, S+1]
+    ```
+#### Load it back:
 
-```python
-import numpy as np
-data = np.load("trace.npz")
-positions = data["positions"]   # ndarray [N, S+1, 3]
-stokes    = data["stokes"]      # ndarray [N, S+1, 4]
-```
-Use case: post-processing, plotting, or statistical analysis in NumPy / SciPy / Pandas.
+    ```python
+    import numpy as np
+    data = np.load("trace.npz")
+    positions = data["positions"]   # ndarray [N, S+1, 3]
+    stokes    = data["stokes"]      # ndarray [N, S+1, 4]
+    ```
+    **Use case:** post-processing, plotting, or statistical analysis in NumPy / SciPy / Pandas.
 
-STL — 3D ray tracks (mesh file)
-```python
-from georay import export_ray_history_to_stl
-```
-export_ray_history_to_stl(out, "ray_tracks.stl", radius=0.02, sides=6)
-Saves every ray segment as a small cylinder in a single STL mesh. Parameters:
-
-Argument	Default	Description
-filename	"ray_tracks.stl"	Output file path.
-radius	0.02	Radius of each cylinder (in world units).
-sides	6	Number of polygon sides per cylinder cross-section.
-Use case: visual inspection in MeshLab, Blender, ParaView, or any STL viewer.
-
-Note: STL is a surface mesh format (no color, no per-ray metadata). For data analysis use NPZ.
+### STL — 3D ray tracks (mesh file)
+    ```python
+    from georay import export_ray_history_to_stl
+    
+    export_ray_history_to_stl(out, "ray_tracks.stl", radius=0.02, sides=6)
+    ```
+    saves every ray segment as a small cylinder in a single STL mesh. Parameters:
+    
+    |Argument	|Default	|Description|
+    |:---       |:---       |:---|
+    |filename	|"ray_tracks.stl"	|Output file path.|
+    |radius	|0.02	|Radius of each cylinder (in world units).|
+    |sides	|6	|Number of polygon sides per cylinder cross-section.|
+    **Use case:** visual inspection in MeshLab, Blender, ParaView, or any STL viewer.
+    
+    **Note:** STL is a surface mesh format (no color, no per-ray metadata). For data analysis use NPZ.
 
 ## Examples
 Several runnable demos are provided:
