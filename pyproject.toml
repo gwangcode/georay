@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "georay"
+version = "1.0.0"
+description = "A GPU-accelerated ray tracer for gradient-index and polarization optics"
+readme = "README.md"
+license = {file = "LICENSE"}
+authors = [
+    {name = "Your Name", email = "your.email@example.com"}
+]
+requires-python = ">=3.8"
+dependencies = [
+    "torch>=2.0.0",
+    "numpy>=1.21.0",
+    "trimesh>=3.20.0",
+]
+keywords = ["ray-tracing", "optics", "gradient-index", "polarization", "gpu"]
+classifiers = [
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Physics",
+]
+
+[project.urls]
+Homepage = "https://github.com/YOUR_USERNAME/GeoRay"
+Documentation = "https://github.com/YOUR_USERNAME/GeoRay/blob/main/README.md"
+Repository = "https://github.com/YOUR_USERNAME/GeoRay"
+
+[tool.setuptools.packages.find]
+include = ["georay*"]
