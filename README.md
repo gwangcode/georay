@@ -271,13 +271,13 @@ For large scenes, use mixed precision (AMP) in your training loop if embedding G
 BVH build time is O(F log F) in number of triangles; tracing scales as O(log F) per ray.
 
 ## Limitations
-Triangle meshes only (no NURBS or implicit surfaces).
+- Triangle meshes only (no NURBS or implicit surfaces).
 
-Diffuse scattering assumes fully randomized polarization.
+- Diffuse scattering assumes fully randomized polarization.
 
-Anisotropic fields must be user-supplied as BaseGRINField subclasses.
+- Anisotropic fields must be user-supplied as BaseGRINField subclasses.
 
-No wavelength-dependent dispersion inside GRIN fields (user must supply n(λ)).
+- No wavelength-dependent dispersion inside GRIN fields (user must supply n(λ)).
 
 ## Citation
 If you use GeoRay in your research, please cite:
