@@ -79,7 +79,7 @@ print(f"Output shape: {out['positions'].shape}")
 ```
 
 # Output Description
-tracer.trace(rays, ...) returns a Python dict of PyTorch tensors containing the full history of every ray. Let N be the number of rays and S the number of recorded steps (initial state + each propagation step). All tensors are on the same device as the input rays.
+```tracer.trace(rays, ...)``` returns a Python ```dict``` of PyTorch tensors containing the full history of every ray. Let N be the number of rays and S the number of recorded steps (initial state + each propagation step). All tensors are on the same device as the input rays.
 
 Key	Shape	Dtype	Description
 positions	[N, S+1, 3]	float32	3D position of each ray at every step, in world coordinates (x, y, z).
