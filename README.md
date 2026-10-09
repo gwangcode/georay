@@ -77,12 +77,14 @@ print(f"Energy conserved: {out['energy_conserved']}")
 print(f"Output shape: {out['positions'].shape}")
 ```
 ## Examples
-Three runnable demos are provided:
+Several runnable demos are provided:
 
 ```bash
-python examples/demo_cube.py           # Fresnel reflection at cube surfaces
-python examples/demo_grin.py           # Ray bending in a parabolic GRIN medium
-python examples/demo_polarization.py   # s/p polarization evolution at a glass interface
+python examples/demo_cube.py               # Fresnel reflection at cube surfaces
+python examples/demo_grin.py               # Ray bending in a parabolic GRIN medium
+python examples/demo_polarization.py       # s/p polarization evolution at a glass interface
+python examples/demo_stepmesh.py           # Multi-body STEP assembly (requires stepmesh)
+python examples/quick_check_stepfiles.py   # Validation script for stepmesh integration
 ```
 Each demo prints the traced ray count, energy conservation status, and output shapes.
 
