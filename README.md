@@ -24,7 +24,7 @@
 ## Installation
 
 ```bash
-git clone https://github.com/gwangcode/GeoRay.git
+git clone https://github.com/gwangcode/georay.git
 cd GeoRay
 pip install -e .
 ```
