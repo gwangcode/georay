@@ -3,8 +3,8 @@ cff-version: 1.2.0
 message: "If you use this software, please cite it as below."
 title: "GeoRay: A GPU-Accelerated Ray Tracer for Gradient-Index and Polarization Optics"
 authors:
-  - family-names: "YourLastName"
-    given-names: "YourFirstName"
+  - family-names: "Wang"
+    given-names: "Gang"
 version: 1.0.0
-date-released: 2025-01-01
+date-released: 2026-10-09
 license: MIT
