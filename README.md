@@ -167,6 +167,7 @@ saves every ray segment as a small cylinder in a single STL mesh. Parameters:
 |filename	|"ray_tracks.stl"	|Output file path.|
 |radius	|0.02	|Radius of each cylinder (in world units).|
 |sides	|6	|Number of polygon sides per cylinder cross-section.|
+
 **Use case:** visual inspection in MeshLab, Blender, ParaView, or any STL viewer.
 
 **Note:** STL is a surface mesh format (no color, no per-ray metadata). For data analysis use NPZ.
