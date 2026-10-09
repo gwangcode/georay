@@ -189,13 +189,13 @@ Each demo prints the traced ray count, energy conservation status, and output sh
 pip install pytest
 pytest tests/
 ```
-The test suite covers:
+**The test suite covers:**
 
-BVH ray-mesh intersection (hit and miss cases)
+- BVH ray-mesh intersection (hit and miss cases)
 
-GRIN field parsing (constant and function-based)
+- GRIN field parsing (constant and function-based)
 
-Polarization utilities (perpendicular basis, Jones-Mueller identity, DoP bounds)
+- Polarization utilities (perpendicular basis, Jones-Mueller identity, DoP bounds)
 
 ## API Overview
 ### Symbol	Description
