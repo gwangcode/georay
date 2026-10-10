@@ -302,7 +302,6 @@ If you use GeoRay in your research, please cite our paper:
 **Software (GitHub):**
 
 > G. Wang, "GeoRay: A GPU-Accelerated Ray Tracer for Gradient-Index and Polarization Optics," GitHub repository, 2026. URL: [https://github.com/gwangcode/georay](https://github.com/gwangcode/georay)
-```
 
 ## License
 MIT License. See LICENSE for details.
