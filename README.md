@@ -280,16 +280,28 @@ BVH build time is O(F log F) in number of triangles; tracing scales as O(log F) 
 - No wavelength-dependent dispersion inside GRIN fields (user must supply n(λ)).
 
 ## Citation
-If you use GeoRay in your research, please cite:
+If you use GeoRay in your research, please cite our paper:
+
+**Paper (Preprint, Zenodo):**
+
+> G. Wang, "GeoRay: A GPU-Accelerated Ray Tracer for Gradient-Index and Polarization Optics," *Zenodo*, 2026. DOI: [10.5281/zenodo.23284911](https://doi.org/10.5281/zenodo.23284911)
+
+**BibTeX:**
 
 ```bibtex
-@article{wang2026georay,
-  title   = {GeoRay: A GPU-Accelerated Ray Tracer for Gradient-Index and Polarization Optics},
-  author  = {Gang Wang},
-  journal = {Journal of Data- and Knowledge-Integrated Simulation Science},
-  year    = {2026},
-  doi     = {10.5281/zenodo.22983753}
+@misc{wang2026georay,
+  title     = {GeoRay: A GPU-Accelerated Ray Tracer for Gradient-Index and Polarization Optics},
+  author    = {Wang, Gang},
+  year      = {2026},
+  publisher = {Zenodo},
+  doi       = {10.5281/zenodo.23284911},
+  url       = {https://doi.org/10.5281/zenodo.23284911}
 }
+```
+
+**Software (GitHub):**
+
+> G. Wang, "GeoRay: A GPU-Accelerated Ray Tracer for Gradient-Index and Polarization Optics," GitHub repository, 2026. URL: [https://github.com/gwangcode/georay](https://github.com/gwangcode/georay)
 ```
 
 ## License
