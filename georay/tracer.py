@@ -1,9 +1,9 @@
-"""Main ray tracer class for GeoRay."""
+"""Main ray tracer class for GeoRay with OptiX acceleration."""
 import math
 import torch
 import torch.nn as nn
 
-from .bvh import BVHMeshIntersector
+from .optix_bvh import OptixMeshIntersector          # ★ OptiX 加速器
 from .interpolation import create_pure_torch_interpolated_cfg
 from .grin import parse_grin_input_to_field
 from .integrator import adaptive_rk4_step_per_ray
@@ -18,20 +18,12 @@ from .polarization import (
 
 
 class AdvancedRayTracerPBRTGPU:
-    """GPU-accelerated ray tracer with BVH, GRIN, and polarization support.
+    """GPU-accelerated ray tracer with OptiX, GRIN, and polarization support."""
 
-    GPU 优化点：
-      * 预计算材质标量查找表（all_simple 路径），避免表面交互中的
-        `torch.unique` + `.item()` + `.any()` 循环。
-      * GRIN 单场快路径：跳过 `torch.unique`，直接对整个 grin_mask 处理。
-      * 用固定 medium id 范围循环替代 `torch.unique(curr_medium_ids)`。
-    """
-
-    def __init__(self, vertices, faces, face_materials, materials_cfg, device,
-                 use_compile: bool = False):          # ← 新增参数
+    def __init__(self, vertices, faces, face_materials, materials_cfg, device):
         self.device = device
-        self.intersector = BVHMeshIntersector(
-            vertices, faces, device, use_compile=use_compile)   # ← 透传
+        # ★ 使用 OptiX 加速求交器
+        self.intersector = OptixMeshIntersector(vertices, faces, device)
         self.face_materials = face_materials.to(dtype=torch.long, device=device)
         self.materials_cfg = materials_cfg
         self.num_faces = faces.shape[0]
@@ -70,12 +62,9 @@ class AdvancedRayTracerPBRTGPU:
         for med_id in self.grin_fields.keys():
             self.grin_medium_mask[med_id] = True
 
-        # ★ 优化：预计算介质 id 固定范围（替代 torch.unique 循环）
         self.max_medium_id = max_med
 
-        # ★ 优化：预计算材质标量查找表
-        #   若所有材质的 n/reflectivity/diffuse/absorptivity 都是标量，
-        #   则用 gather 替代表面交互中的 torch.unique + .item() 循环。
+        # ★ 预计算材质标量查找表
         self.max_mat_id = max(materials_cfg.keys()) if materials_cfg else 0
         self.all_simple = self._check_all_simple(materials_cfg)
         if self.all_simple:
@@ -102,26 +91,7 @@ class AdvancedRayTracerPBRTGPU:
     def trace(self, ray_dict, max_steps=50, ds_init=0.02, ds_min=1e-3,
               ds_max=0.1, rk_tol=1e-4, fresnel=True, verbose=False,
               surface_model=None, rr_threshold=0.0):
-        """Trace rays through the scene.
-
-        Args:
-            ray_dict: output of generate_rays().
-            max_steps, ds_init, ds_min, ds_max, rk_tol: integrator params.
-            fresnel: legacy flag. If surface_model is None:
-                fresnel=True  -> surface_model="coated"
-                fresnel=False -> surface_model="custom"
-            surface_model: "fresnel" | "custom" | "coated".
-            verbose: print GRIN step diagnostics.
-            rr_threshold: Russian roulette threshold (0 disables).
-
-        Returns:
-            dict with keys:
-                positions, stokes, active, wavelengths,
-                reflectivity, transmissivity, absorptivity,
-                n1, n2, polarization_deg, dop,
-                energy, rk_error, ds_history, energy_conserved.
-        """
-        # ---- Resolve surface_model ----
+        """Trace rays through the scene."""
         if surface_model is None:
             surface_model = "coated" if fresnel else "custom"
         if surface_model not in ("fresnel", "custom", "coated"):
@@ -129,7 +99,6 @@ class AdvancedRayTracerPBRTGPU:
                 f"surface_model must be 'fresnel', 'custom', or 'coated', "
                 f"got '{surface_model}'")
 
-        # ---- Initialize state ----
         curr_origins = ray_dict["origins"].clone()
         curr_dirs = ray_dict["dirs"].clone()
         curr_wls = ray_dict["wavelengths"].clone()
@@ -145,7 +114,7 @@ class AdvancedRayTracerPBRTGPU:
         curr_weight = torch.ones(N, device=self.device)
         ds_per_ray = torch.full((N,), float(ds_init), device=self.device)
 
-        # ---- History buffers ----
+        # History buffers
         hist_pos = [curr_origins.clone()]
         hist_stokes = [curr_stokes.clone()]
         hist_active = [active_mask.clone()]
@@ -166,11 +135,7 @@ class AdvancedRayTracerPBRTGPU:
             if not active_mask.any():
                 break
 
-            # ============================================================
-            # 1. Intersection
-            # ★ 优化：用固定 medium id 范围遍历，替代
-            #   `torch.unique(curr_medium_ids[active_mask])` + `.item()`。
-            # ============================================================
+            # ---------- 1. Intersection (OptiX) ----------
             hit_dist = torch.full((N,), float('inf'), device=self.device)
             hit_face_ids = torch.full((N,), -1, dtype=torch.long, device=self.device)
             hit_normals = torch.zeros((N, 3), device=self.device)
@@ -203,10 +168,7 @@ class AdvancedRayTracerPBRTGPU:
             step_n2 = torch.ones((N, 1), device=self.device)
             step_rk_err = torch.zeros(N, device=self.device)
 
-            # ============================================================
-            # 3. GRIN stepping
-            # ★ 优化：单 GRIN 场时跳过 torch.unique 循环
-            # ============================================================
+            # ---------- 3. GRIN stepping ----------
             is_in_grin = self.grin_medium_mask[curr_medium_ids]
             grin_mask = active_mask & is_in_grin & (hit_dist > ds_per_ray)
 
@@ -252,7 +214,6 @@ class AdvancedRayTracerPBRTGPU:
                                   f"{h_new.max().item():.5f}], "
                                   f"acc={accepted.float().mean().item():.1%}")
                 else:
-                    # 多 GRIN 场：保留原逻辑
                     grin_meds = torch.unique(curr_medium_ids[grin_mask])
                     for g_med_id in grin_meds:
                         g_val = g_med_id.item()
@@ -289,9 +250,7 @@ class AdvancedRayTracerPBRTGPU:
                         ds_per_ray[sub_mask] = h_new
                         field.clear_context()
 
-            # ============================================================
-            # 4. Surface interaction
-            # ============================================================
+            # ---------- 4. Surface interaction ----------
             mesh_hit_mask = active_mask & (~grin_mask) & (hit_face_ids >= 0)
             if mesh_hit_mask.any():
                 hit_pts = curr_origins[mesh_hit_mask] + \
@@ -318,7 +277,7 @@ class AdvancedRayTracerPBRTGPU:
                 wls_hit = curr_wls[mesh_hit_mask]
                 cos_hit = cos_theta_i
 
-                # ---- Incident-plane s basis ----
+                # Incident-plane s basis
                 cross_plane = torch.cross(dirs_in, oriented_normals, dim=-1)
                 norm_plane = torch.norm(cross_plane, dim=-1, keepdim=True)
                 degenerate = norm_plane.squeeze(-1) < 1e-8
@@ -331,10 +290,7 @@ class AdvancedRayTracerPBRTGPU:
                     stokes_in, s_ref_in, s_plane, dirs_in)
                 S1_plane = stokes_plane[:, 1:2]
 
-                # ============================================================
-                # ★ 优化：材质值查询
-                #   all_simple 路径用 gather 一次拿到所有值，无循环无同步。
-                # ============================================================
+                # Material values (fast path: lookup table)
                 if self.all_simple:
                     n1_vals = self.n_table[n1_ids].unsqueeze(-1)
                     n2_vals = self.n_table[n2_ids].unsqueeze(-1)
@@ -367,7 +323,7 @@ class AdvancedRayTracerPBRTGPU:
                 n1_vals = torch.clamp(n1_vals, min=1.0)
                 n2_vals = torch.clamp(n2_vals, min=1.0)
 
-                # ---- Fresnel ----
+                # Fresnel
                 eta = n1_vals / n2_vals
                 sin2_t = torch.clamp(1.0 - cos_theta_i ** 2, min=0.0)
                 sin2_tt = (eta ** 2) * sin2_t
@@ -389,7 +345,6 @@ class AdvancedRayTracerPBRTGPU:
                 R_s = r_s ** 2
                 R_p = r_p ** 2
 
-                # ---- Polarization-weighted Fresnel reflectance ----
                 w_s = 0.5 * (1.0 + S1_plane)
                 w_p = 0.5 * (1.0 - S1_plane)
                 R_eff = w_s * R_s + w_p * R_p
@@ -423,7 +378,7 @@ class AdvancedRayTracerPBRTGPU:
                 step_n1[mesh_hit_mask] = n1_vals
                 step_n2[mesh_hit_mask] = n2_vals
 
-                # ---- Directions ----
+                # Directions
                 reflect_dirs = dirs_in + 2.0 * cos_theta_i * oriented_normals
                 reflect_dirs = reflect_dirs / torch.norm(
                     reflect_dirs, dim=-1, keepdim=True)
@@ -432,7 +387,7 @@ class AdvancedRayTracerPBRTGPU:
                 refract_dirs = refract_dirs / torch.norm(
                     refract_dirs, dim=-1, keepdim=True)
 
-                # ---- Diffuse sampling ----
+                # Diffuse sampling
                 num_hits = hit_pts.shape[0]
                 r_sq = torch.rand(num_hits, 1, device=self.device)
                 sin_theta_d = torch.sqrt(r_sq)
@@ -451,7 +406,7 @@ class AdvancedRayTracerPBRTGPU:
                 diffuse_dirs = diffuse_dirs / torch.norm(
                     diffuse_dirs, dim=-1, keepdim=True)
 
-                # ---- Monte Carlo event selection ----
+                # Monte Carlo event selection
                 rand_val = torch.rand_like(P_absorb)
                 is_abs = rand_val < P_absorb
                 is_diff = (~is_abs) & (rand_val < (P_absorb + P_diffuse))
@@ -470,7 +425,7 @@ class AdvancedRayTracerPBRTGPU:
                                          new_weight)
                 next_weight[mesh_hit_mask] = new_weight.squeeze(-1)
 
-                # ---- Russian roulette ----
+                # Russian roulette
                 K = mesh_hit_mask.sum().item()
                 rr_kill = torch.zeros(K, dtype=torch.bool, device=self.device)
                 if rr_threshold > 0.0:
@@ -487,7 +442,7 @@ class AdvancedRayTracerPBRTGPU:
                         needs_rr, boosted, cur_w)
                     rr_kill = needs_rr & (~surv)
 
-                # ---- Polarization update ----
+                # Polarization update
                 stokes_refl_plane = apply_jones_mueller(stokes_plane, r_s, r_p)
                 stokes_refr_plane = apply_jones_mueller(stokes_plane, t_s, t_p)
                 stokes_diff_plane = randomize_stokes_diffuse(stokes_plane)
@@ -517,20 +472,16 @@ class AdvancedRayTracerPBRTGPU:
                     is_reflected.squeeze(-1), n1_ids, n2_ids)
                 prev_hit_faces[mesh_hit_mask] = faces_hit
 
-                # Kill absorbed rays
                 if is_abs.any():
                     absorbed_idx = torch.where(mesh_hit_mask)[0][
                         is_abs.squeeze(-1)]
                     active_mask[absorbed_idx] = False
 
-                # Kill Russian-roulette victims
                 if rr_kill.any():
                     rr_idx = torch.where(mesh_hit_mask)[0][rr_kill]
                     active_mask[rr_idx] = False
 
-            # ============================================================
-            # 5. Escape
-            # ============================================================
+            # ---------- 5. Escape ----------
             no_hit_mask = active_mask & (~grin_mask) & (hit_face_ids < 0)
             if no_hit_mask.any():
                 next_origins[no_hit_mask] = curr_origins[no_hit_mask] + \
@@ -564,9 +515,7 @@ class AdvancedRayTracerPBRTGPU:
 
             step += 1
 
-        # =============================================================
-        # ★ Energy conservation check
-        # =============================================================
+        # Energy conservation check
         energy_hist = torch.stack(hist_energy, dim=1)
 
         in_range = bool(torch.all(
