@@ -27,9 +27,11 @@ class AdvancedRayTracerPBRTGPU:
       * 用固定 medium id 范围循环替代 `torch.unique(curr_medium_ids)`。
     """
 
-    def __init__(self, vertices, faces, face_materials, materials_cfg, device):
+    def __init__(self, vertices, faces, face_materials, materials_cfg, device,
+                 use_compile: bool = False):          # ← 新增参数
         self.device = device
-        self.intersector = BVHMeshIntersector(vertices, faces, device)
+        self.intersector = BVHMeshIntersector(
+            vertices, faces, device, use_compile=use_compile)   # ← 透传
         self.face_materials = face_materials.to(dtype=torch.long, device=device)
         self.materials_cfg = materials_cfg
         self.num_faces = faces.shape[0]

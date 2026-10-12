@@ -1,13 +1,9 @@
 """BVH acceleration structure and triangle mesh intersector.
 
-GPU-friendly rewrite:
-    * Fixed-length `for` loop instead of `while` (removes Python overhead
-      and eliminates ~500+ small kernel launches per intersect).
-    * Fully vectorized leaf-triangle test: every ray processes its
-      up-to-`max_leaf_size` triangles in parallel with no branch / no
-      `torch.where`-on-varying-shape.
-    * Pre-allocated per-ray stack with capacity derived from BVH depth.
-    * No `.item()` / `.any()`-triggered GPU-CPU sync inside the loop.
+回滚到原始 while 循环版本。原版在 CPU/GPU 上都比"全向量化重写"更快，
+因为原版只在确有工作时才处理，而不是无差别对全部 N 条光线做叶子测试。
+
+新增：可选的 torch.compile 包装（默认关闭）。
 """
 import torch
 
@@ -27,10 +23,6 @@ class BVH:
 
         self.max_depth = 0
         self._build_bvh()
-
-        # Pre-compute leaf offsets for vectorized leaf test
-        self._leaf_offsets = torch.arange(
-            self.max_leaf_size, device=self.device, dtype=torch.long)
 
     def _build_bvh(self):
         nodes = []
@@ -77,160 +69,163 @@ class BVH:
         self.left_or_start = nodes_tensor[:, 6].long().contiguous()
         self.right_or_count = nodes_tensor[:, 7].long().contiguous()
         self.is_leaf = (nodes_tensor[:, 8] > 0.5).contiguous()
-        self.reordered_tri_ids = torch.tensor(
-            reordered_indices, dtype=torch.long, device=self.device)
+        self.reordered_tri_ids = torch.tensor(reordered_indices, dtype=torch.long,
+                                              device=self.device)
         self.ordered_triangles = self.triangles[self.reordered_tri_ids].contiguous()
         self.stack_capacity = max(32, min(512, self.max_depth * 2 + 16))
 
     @torch.no_grad()
     def ray_cast(self, ray_origins, ray_dirs, allowed_face_mask=None, eps=1e-4):
-        """Vectorized BVH traversal with fixed iteration count."""
-        N = ray_origins.shape[0]
-        device = self.device
+        """Public entry point — delegates to _ray_cast_impl."""
+        return self._ray_cast_impl(ray_origins, ray_dirs,
+                                   allowed_face_mask, eps)
 
-        # ---- Safe division ----
-        safe_dirs = torch.where(
-            torch.abs(ray_dirs) < 1e-8,
-            torch.where(ray_dirs >= 0,
-                        torch.full_like(ray_dirs, 1e-8),
-                        torch.full_like(ray_dirs, -1e-8)),
-            ray_dirs)
+    def _ray_cast_impl(self, ray_origins, ray_dirs, allowed_face_mask=None, eps=1e-4):
+        """原始 while 循环实现。这是经过验证的最快纯 PyTorch 版本。"""
+        N = ray_origins.shape[0]
+        safe_dirs = torch.where(torch.abs(ray_dirs) < 1e-8,
+                                torch.where(ray_dirs >= 0,
+                                            torch.full_like(ray_dirs, 1e-8),
+                                            torch.full_like(ray_dirs, -1e-8)),
+                                ray_dirs)
         inv_dirs = 1.0 / safe_dirs
 
-        # ---- Outputs ----
-        min_hit_t = torch.full((N,), float('inf'), device=device)
-        hit_face_idx = torch.full((N,), -1, dtype=torch.long, device=device)
-        hit_u = torch.zeros((N,), device=device)
-        hit_v = torch.zeros((N,), device=device)
+        min_hit_t = torch.full((N,), float('inf'), device=self.device)
+        hit_face_idx = torch.full((N,), -1, dtype=torch.long, device=self.device)
+        hit_u = torch.zeros((N,), device=self.device)
+        hit_v = torch.zeros((N,), device=self.device)
 
-        # ---- Pre-allocated per-ray stack ----
-        stack = torch.zeros((N, self.stack_capacity), dtype=torch.long, device=device)
-        stack_ptr = torch.ones(N, dtype=torch.long, device=device)
-        # stack[:, 0] = 0 by default; root node = 0
+        stack = torch.zeros((N, self.stack_capacity), dtype=torch.long,
+                            device=self.device)
+        stack_ptr = torch.zeros((N,), dtype=torch.long, device=self.device)
+        stack[:, 0] = 0
+        stack_ptr += 1
 
-        ray_ids = torch.arange(N, device=device)
-        leaf_offsets = self._leaf_offsets.unsqueeze(0)   # [1, max_leaf]
+        active_mask = stack_ptr > 0
+        ray_ids = torch.arange(N, device=self.device)
 
-        # Fixed iteration count. Each iteration pops 1 node, may push 2.
-        max_iter = 4 * self.stack_capacity + 8
-        C = self.stack_capacity
+        while active_mask.any():
+            stack_ptr = torch.where(active_mask, stack_ptr - 1, stack_ptr)
+            curr_node_idx = stack[ray_ids, stack_ptr]
 
-        for _ in range(max_iter):
-            # Early exit: all stacks empty
-            if not stack_ptr.any():
-                break
+            n_min = self.node_min[curr_node_idx]
+            n_max = self.node_max[curr_node_idx]
+            l_start = self.left_or_start[curr_node_idx]
+            r_count = self.right_or_count[curr_node_idx]
+            leaf_flag = self.is_leaf[curr_node_idx]
 
-            # ---- Pop ----
-            has_work = stack_ptr > 0
-            pop = torch.clamp(stack_ptr - 1, min=0)
-            curr_node = stack[ray_ids, pop]
-            stack_ptr = torch.where(has_work, pop, stack_ptr)
-
-            # ---- Gather node data ----
-            n_min = self.node_min[curr_node]          # [N, 3]
-            n_max = self.node_max[curr_node]
-            l_start = self.left_or_start[curr_node]   # [N]
-            r_count = self.right_or_count[curr_node]
-            leaf_flag = self.is_leaf[curr_node]       # [N] bool
-
-            # ---- Slab AABB test ----
             t1 = (n_min - ray_origins) * inv_dirs
             t2 = (n_max - ray_origins) * inv_dirs
             tmin = torch.min(t1, t2)
             tmax = torch.max(t1, t2)
             t_near = torch.max(tmin, dim=-1)[0]
             t_far = torch.min(tmax, dim=-1)[0]
-            hit_aabb = (has_work
-                        & (t_far >= torch.maximum(t_near, torch.zeros_like(t_near)))
-                        & (t_near < min_hit_t))
+            hit_aabb = active_mask & (t_far >= torch.maximum(
+                t_near, torch.zeros_like(t_near))) & (t_near < min_hit_t)
 
-            # ============================================================
-            # Leaf test: all rays × up to max_leaf_size triangles, no branch
-            # ============================================================
-            # [N, max_leaf]  local triangle index within the leaf
-            leaf_hit_root = hit_aabb & leaf_flag                # [N]
-            tri_local = l_start.unsqueeze(-1) + leaf_offsets    # [N, max_leaf]
-            in_range = leaf_offsets < r_count.unsqueeze(-1)     # [N, max_leaf]
-            leaf_active = leaf_hit_root.unsqueeze(-1) & in_range  # [N, max_leaf]
+            # ---- Leaf test (conditional) ----
+            leaf_hits = hit_aabb & leaf_flag
+            if leaf_hits.any():
+                hit_ray_indices = torch.where(leaf_hits)[0]
+                starts = l_start[hit_ray_indices]
+                counts = r_count[hit_ray_indices]
+                ray_repeated = torch.repeat_interleave(hit_ray_indices, counts)
+                offsets_base = torch.arange(self.max_leaf_size,
+                                            device=self.device).unsqueeze(0)
+                mask_offsets = offsets_base < counts.unsqueeze(-1)
+                tri_offsets = offsets_base.expand(counts.shape[0], -1)[mask_offsets]
+                tri_starts_rep = torch.repeat_interleave(starts, counts)
+                flat_tri_indices = tri_starts_rep + tri_offsets
 
-            tri_safe = tri_local.clamp(0, max(self.num_faces - 1, 0))
-            tris_flat = self.ordered_triangles[tri_safe]        # [N, max_leaf, 3, 3]
-            tri_orig = self.reordered_tri_ids[tri_safe]         # [N, max_leaf]
+                o_flat = ray_origins[ray_repeated]
+                d_flat = ray_dirs[ray_repeated]
+                tris_flat = self.ordered_triangles[flat_tri_indices]
+                tri_orig_ids_flat = self.reordered_tri_ids[flat_tri_indices]
 
-            v0 = tris_flat[:, :, 0]                             # [N, max_leaf, 3]
-            v1 = tris_flat[:, :, 1]
-            v2 = tris_flat[:, :, 2]
-            e1 = v1 - v0
-            e2 = v2 - v0
+                v0, v1, v2 = tris_flat[:, 0], tris_flat[:, 1], tris_flat[:, 2]
+                e1, e2 = v1 - v0, v2 - v0
+                pvec = torch.cross(d_flat, e2, dim=-1)
+                det = torch.sum(e1 * pvec, dim=-1)
+                valid_det = torch.abs(det) > 1e-10
+                inv_det = 1.0 / torch.where(valid_det, det, torch.ones_like(det))
+                tvec = o_flat - v0
+                u = torch.sum(tvec * pvec, dim=-1) * inv_det
+                qvec = torch.cross(tvec, e1, dim=-1)
+                v = torch.sum(d_flat * qvec, dim=-1) * inv_det
+                t = torch.sum(e2 * qvec, dim=-1) * inv_det
 
-            o = ray_origins.unsqueeze(1)                        # [N, 1, 3]
-            d = ray_dirs.unsqueeze(1)                           # [N, 1, 3]
+                valid = (valid_det & (u >= 0.0) & (u <= 1.0) & (v >= 0.0) &
+                         (u + v <= 1.0) & (t > eps) &
+                         (t < min_hit_t[ray_repeated]))
+                if allowed_face_mask is not None:
+                    valid = valid & allowed_face_mask[tri_orig_ids_flat]
 
-            pvec = torch.cross(d, e2, dim=-1)                   # broadcast -> [N, max_leaf, 3]
-            det = (e1 * pvec).sum(dim=-1)                       # [N, max_leaf]
-            valid_det = torch.abs(det) > 1e-10
-            inv_det = torch.where(valid_det, 1.0 / det, torch.zeros_like(det))
+                if valid.any():
+                    v_ray_ids = ray_repeated[valid]
+                    v_t = t[valid]
+                    v_tri_ids = tri_orig_ids_flat[valid]
+                    v_u = u[valid]
+                    v_v = v[valid]
 
-            tvec = o - v0                                       # [N, max_leaf, 3]
-            u = (tvec * pvec).sum(dim=-1) * inv_det             # [N, max_leaf]
-            qvec = torch.cross(tvec, e1, dim=-1)
-            v = (d * qvec).sum(dim=-1) * inv_det
-            t = (e2 * qvec).sum(dim=-1) * inv_det
+                    sort_perm = torch.argsort(v_t)
+                    s_ray_ids = v_ray_ids[sort_perm]
+                    s_t = v_t[sort_perm]
+                    s_tri_ids = v_tri_ids[sort_perm]
+                    s_u = v_u[sort_perm]
+                    s_v = v_v[sort_perm]
 
-            valid = (leaf_active & valid_det
-                     & (u >= 0.0) & (u <= 1.0)
-                     & (v >= 0.0) & (u + v <= 1.0)
-                     & (t > eps)
-                     & (t < min_hit_t.unsqueeze(-1)))
+                    unique_rays, inverse = torch.unique(s_ray_ids,
+                                                        return_inverse=True)
+                    idx_all = torch.arange(s_ray_ids.shape[0], device=self.device)
+                    first_indices = torch.full((unique_rays.shape[0],),
+                                               s_ray_ids.shape[0],
+                                               dtype=torch.long,
+                                               device=self.device)
+                    first_indices.scatter_reduce_(0, inverse, idx_all,
+                                                  reduce="amin", include_self=True)
 
-            if allowed_face_mask is not None:
-                valid = valid & allowed_face_mask[tri_orig]
+                    better_mask = s_t[first_indices] < min_hit_t[unique_rays]
+                    target_rays = unique_rays[better_mask]
+                    target_indices = first_indices[better_mask]
 
-            # Pick best (min-t) triangle per ray
-            t_for_min = torch.where(valid, t, torch.full_like(t, float('inf')))
-            best_t, best_slot = t_for_min.min(dim=-1)           # [N], [N]
-            any_valid = valid.any(dim=-1)                       # [N]
+                    min_hit_t[target_rays] = s_t[target_indices]
+                    hit_face_idx[target_rays] = s_tri_ids[target_indices]
+                    hit_u[target_rays] = s_u[target_indices]
+                    hit_v[target_rays] = s_v[target_indices]
 
-            best_tri = tri_orig.gather(1, best_slot.unsqueeze(-1)).squeeze(-1)
-            best_u = u.gather(1, best_slot.unsqueeze(-1)).squeeze(-1)
-            best_v = v.gather(1, best_slot.unsqueeze(-1)).squeeze(-1)
-
-            update = any_valid & (best_t < min_hit_t)
-            min_hit_t = torch.where(update, best_t, min_hit_t)
-            hit_face_idx = torch.where(update, best_tri, hit_face_idx)
-            hit_u = torch.where(update, best_u, hit_u)
-            hit_v = torch.where(update, best_v, hit_v)
-
-            # ============================================================
-            # Inner node: push children (vectorized, no branch)
-            # ============================================================
+            # ---- Inner node push (conditional) ----
             inner_hits = hit_aabb & (~leaf_flag)
-            can_push = stack_ptr < (C - 2)
-            push_mask = inner_hits & can_push                    # [N]
+            if inner_hits.any():
+                can_push = stack_ptr < (self.stack_capacity - 1)
+                push_mask = inner_hits & can_push
+                stack[push_mask, stack_ptr[push_mask]] = l_start[push_mask]
+                stack_ptr = torch.where(push_mask, stack_ptr + 1, stack_ptr)
+                stack[push_mask, stack_ptr[push_mask]] = r_count[push_mask]
+                stack_ptr = torch.where(push_mask, stack_ptr + 1, stack_ptr)
 
-            # Push left
-            stack[ray_ids, stack_ptr] = torch.where(
-                push_mask, l_start, stack[ray_ids, stack_ptr])
-            stack_ptr = torch.where(push_mask, stack_ptr + 1, stack_ptr)
+            active_mask = stack_ptr > 0
 
-            # Push right
-            stack[ray_ids, stack_ptr] = torch.where(
-                push_mask, r_count, stack[ray_ids, stack_ptr])
-            stack_ptr = torch.where(push_mask, stack_ptr + 1, stack_ptr)
-
-        # ---- Finalize ----
         hit_mask = (min_hit_t < float('inf')) & (hit_face_idx != -1)
         hit_face_ids = torch.where(hit_mask, hit_face_idx,
-                                   torch.tensor(-1, device=device))
+                                   torch.tensor(-1, device=self.device))
         hit_dist = torch.where(hit_mask, min_hit_t,
-                               torch.tensor(float('inf'), device=device))
+                               torch.tensor(float('inf'), device=self.device))
         return hit_dist, hit_face_ids, hit_u, hit_v
 
 
 class BVHMeshIntersector:
-    """Mesh intersector with BVH acceleration."""
+    """Mesh intersector with BVH acceleration.
 
-    def __init__(self, vertices, faces, device):
+    Args:
+        vertices, faces, device: 与原来相同。
+        use_compile: 若为 True，用 torch.compile(mode="reduce-overhead")
+            包装 ray_cast。首次调用会触发编译（数十秒），
+            之后可能带来 1.5~3× 加速（取决于场景）。
+            对 while 循环，torch.compile 会产生图断点，
+            因此**不保证**一定加速——请用基准测试验证。
+    """
+
+    def __init__(self, vertices, faces, device, use_compile: bool = False):
         self.device = device
         self.vertices = vertices.to(dtype=torch.float32, device=device)
         self.faces = faces.to(dtype=torch.long, device=device)
@@ -238,13 +233,38 @@ class BVHMeshIntersector:
         e1 = self.triangles[:, 1] - self.triangles[:, 0]
         e2 = self.triangles[:, 2] - self.triangles[:, 0]
         raw_normals = torch.cross(e1, e2, dim=-1)
-        self.face_normals = raw_normals / (torch.norm(raw_normals, dim=-1, keepdim=True) + 1e-12)
+        self.face_normals = raw_normals / (torch.norm(raw_normals,
+                                                      dim=-1, keepdim=True) + 1e-12)
         self.bvh = BVH(self.triangles)
+
+        self._use_compile = False
+        self._compiled_ray_cast = None
+        if use_compile:
+            try:
+                # 注意：只编译 _ray_cast_impl，不动 __init__
+                self._compiled_ray_cast = torch.compile(
+                    self.bvh._ray_cast_impl,
+                    mode="reduce-overhead",
+                    fullgraph=False,
+                    dynamic=False,
+                )
+                self._use_compile = True
+                print("[BVHMeshIntersector] torch.compile enabled "
+                      "(first call will be slow — compiling)")
+            except Exception as e:
+                print(f"[BVHMeshIntersector] torch.compile failed: {e}. "
+                      f"Falling back to eager.")
+                self._use_compile = False
 
     def intersect(self, ray_origins, ray_dirs, prev_face_ids=None,
                   allowed_face_mask=None, eps=1e-4):
-        hit_dist, hit_face_ids, _, _ = self.bvh.ray_cast(
-            ray_origins, ray_dirs, allowed_face_mask=allowed_face_mask)
+        if self._use_compile and self._compiled_ray_cast is not None:
+            hit_dist, hit_face_ids, _, _ = self._compiled_ray_cast(
+                ray_origins, ray_dirs, allowed_face_mask, eps)
+        else:
+            hit_dist, hit_face_ids, _, _ = self.bvh.ray_cast(
+                ray_origins, ray_dirs, allowed_face_mask, eps)
+
         hit_mask = (hit_dist > eps) & (hit_dist < float('inf'))
         if prev_face_ids is not None:
             hit_mask = hit_mask & (hit_face_ids != prev_face_ids)
@@ -252,6 +272,7 @@ class BVHMeshIntersector:
                                    torch.tensor(-1, device=self.device))
         hit_dist = torch.where(hit_mask, hit_dist,
                                torch.tensor(float('inf'), device=self.device))
-        safe_ids = torch.clamp(hit_face_ids, 0, max(self.faces.shape[0] - 1, 0))
+        safe_ids = torch.clamp(hit_face_ids, 0,
+                               max(self.faces.shape[0] - 1, 0))
         hit_normals = self.face_normals[safe_ids]
         return hit_dist, hit_face_ids, hit_normals
