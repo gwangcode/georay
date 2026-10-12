@@ -40,8 +40,16 @@ def generate_rays(source_type="grid", num_rays=100, origin=(0, 0, 0),
     if source_type == "grid":
         side_len = int(math.sqrt(num_rays))
         num_rays = side_len * side_len
-        x_coords = torch.linspace(bounds[0], bounds[1], side_len, device=device)
-        y_coords = torch.linspace(bounds[2], bounds[3], side_len, device=device)
+        if side_len == 1:
+            # ★ 修复：单点采样取 bounds 中心，避免 torch.linspace(...,1)
+            #   返回左端点导致光源起点偏移。
+            x_coords = torch.tensor([(bounds[0] + bounds[1]) * 0.5],
+                                    dtype=torch.float32, device=device)
+            y_coords = torch.tensor([(bounds[2] + bounds[3]) * 0.5],
+                                    dtype=torch.float32, device=device)
+        else:
+            x_coords = torch.linspace(bounds[0], bounds[1], side_len, device=device)
+            y_coords = torch.linspace(bounds[2], bounds[3], side_len, device=device)
         grid_x, grid_y = torch.meshgrid(x_coords, y_coords, indexing="ij")
         origins = center_org + grid_x.reshape(-1, 1) * u_vec + grid_y.reshape(-1, 1) * v_vec
         dirs = main_dir.unsqueeze(0).expand(num_rays, 3)

@@ -3,14 +3,23 @@ import torch
 
 
 def _choose_perpendicular(d):
-    """Choose a perpendicular reference direction (s_ref) for direction d."""
+    """Physical s-polarization direction = cross(ref, d)."""
     ref = torch.zeros_like(d)
     ref[:, 2] = 1.0
     near_z = torch.abs(d[:, 2]) > 0.99
     ref[near_z] = torch.tensor([0.0, 1.0, 0.0], device=d.device)
-    proj = torch.sum(ref * d, dim=-1, keepdim=True)
-    s = ref - proj * d
-    return s / (torch.norm(s, dim=-1, keepdim=True) + 1e-12)
+
+    s = torch.cross(ref, d, dim=-1)
+
+    norm = s.norm(dim=-1, keepdim=True)
+    eps = 1e-12
+    safe_norm = norm.clamp_min(eps)
+    s_normalized = s / safe_norm
+
+    fallback = torch.zeros_like(s)
+    fallback[:, 0] = 1.0
+    degenerate = (norm < eps).expand_as(s)
+    return torch.where(degenerate, fallback, s_normalized)
 
 
 def rotate_stokes_reference(stokes, s_old, s_new, d):
