@@ -11,21 +11,7 @@ def generate_rays(source_type="grid", num_rays=100, origin=(0, 0, 0),
                   wavelength_nm=550.0, device=torch.device("cpu")):
     """Generate rays of various source types.
 
-    Args:
-        source_type: "grid", "random", "point_source", "area_source", or "mesh_source".
-        num_rays: number of rays (rounded to square for grid).
-        origin: source center (x, y, z).
-        direction: main propagation direction.
-        radius: radius for random source.
-        angle_deg: cone half-angle for point_source.
-        bounds: (xmin, xmax, ymin, ymax) for grid/area_source.
-        mesh: trimesh.Trimesh for mesh_source.
-        polarization: "s", "p", "random", or angle in degrees.
-        wavelength_nm: wavelength in nanometers.
-        device: torch device.
-
-    Returns:
-        dict with keys: origins, dirs, wavelengths, stokes, s_ref, p_ref, ray_ids.
+    与之前相同，仅 grid 单点采样修正。
     """
     main_dir = torch.tensor(direction, dtype=torch.float32, device=device)
     main_dir = main_dir / torch.norm(main_dir)
@@ -41,8 +27,6 @@ def generate_rays(source_type="grid", num_rays=100, origin=(0, 0, 0),
         side_len = int(math.sqrt(num_rays))
         num_rays = side_len * side_len
         if side_len == 1:
-            # ★ 修复：单点采样取 bounds 中心，避免 torch.linspace(...,1)
-            #   返回左端点导致光源起点偏移。
             x_coords = torch.tensor([(bounds[0] + bounds[1]) * 0.5],
                                     dtype=torch.float32, device=device)
             y_coords = torch.tensor([(bounds[2] + bounds[3]) * 0.5],

@@ -1,24 +1,35 @@
-"""Polarization utilities (Jones-Mueller matrices, Stokes vectors)."""
+"""Polarization utilities (Jones-Mueller matrices, Stokes vectors).
+
+GPU 优化点：
+    * `_choose_perpendicular` 用 in-place 操作和 `.where` 减少临时张量分配。
+    * `rotate_stokes_reference` 减少不必要的中间量。
+"""
 import torch
 
 
 def _choose_perpendicular(d):
-    """Physical s-polarization direction = cross(ref, d)."""
+    """Physical s-polarization direction = cross(ref, d).
+
+    ★ 优化：用 in-place 赋值和 torch.where 减少中间张量。
+    """
+    device = d.device
+    # ref 向量：默认 (0, 0, 1)，当 d 接近 ±z 时改用 (0, 1, 0)
     ref = torch.zeros_like(d)
-    ref[:, 2] = 1.0
-    near_z = torch.abs(d[:, 2]) > 0.99
-    ref[near_z] = torch.tensor([0.0, 1.0, 0.0], device=d.device)
+    ref[..., 2] = 1.0
+    near_z = d[..., 2].abs() > 0.99
+    # in-place 只在 near_z 处替换
+    ref[near_z] = torch.tensor([0.0, 1.0, 0.0], device=device, dtype=d.dtype)
 
     s = torch.cross(ref, d, dim=-1)
-
     norm = s.norm(dim=-1, keepdim=True)
     eps = 1e-12
     safe_norm = norm.clamp_min(eps)
     s_normalized = s / safe_norm
 
+    # fallback：当 norm < eps 时（d 与 ref 平行）用 x 轴
     fallback = torch.zeros_like(s)
-    fallback[:, 0] = 1.0
-    degenerate = (norm < eps).expand_as(s)
+    fallback[..., 0] = 1.0
+    degenerate = (norm < eps)
     return torch.where(degenerate, fallback, s_normalized)
 
 

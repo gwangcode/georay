@@ -103,6 +103,13 @@ def parse_grin_input_to_field(grin_cfg, device):
                 self.values = torch.tensor(cfg["values"], dtype=torch.float32, device=dev)
 
             def _trilinear(self, x, y, z, wl=None):
+                # ★ 让切片视图连续，消除 torch.searchsorted 的 non-contiguous warning
+                x = x.contiguous()
+                y = y.contiguous()
+                z = z.contiguous()
+                if wl is not None:
+                    wl = wl.contiguous()
+
                 ix = torch.clamp(torch.searchsorted(self.x_grid, x, right=False),
                                  1, self.x_grid.numel() - 1)
                 tx = ((x - self.x_grid[ix - 1]) /
