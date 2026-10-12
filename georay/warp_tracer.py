@@ -15,6 +15,7 @@
     * Monte Carlo 分支 (reflect / refract / diffuse / absorb)
     * 能量权重累积
     * Diffuse 半球采样
+    * surface_model 支持 "fresnel" / "custom" / "coated"
 
 限制：
     * 不支持 GRIN 介质（后续可扩展）
@@ -126,6 +127,7 @@ def trace_kernel(
     eps: wp.float32,
     far: wp.float32,
     seed: wp.int32,
+    surface_model_flag: wp.int32,   # ★ 0=fresnel, 1=custom, 2=coated
 ):
     tid = wp.tid()
 
@@ -243,7 +245,12 @@ def trace_kernel(
                 w_p = 0.5 * (1.0 - S1p)
                 R_eff = w_s * R_s + w_p * R_p
 
+                # ★ surface_model: 0=fresnel, 1=custom, 2=coated
                 specular_R = R_eff
+                if surface_model_flag == 1:
+                    specular_R = custom_refl
+                elif surface_model_flag == 2:
+                    specular_R = R_eff * custom_refl
                 if is_tir:
                     specular_R = 1.0
 
@@ -297,7 +304,6 @@ def trace_kernel(
                              + cos_theta * normal)
                     new_d = wp.normalize(new_d)
                     d = new_d
-                    # unpolarized
                     S1 = 0.0
                     S2 = 0.0
                     S3 = 0.0
@@ -312,7 +318,6 @@ def trace_kernel(
                     new_d = wp.normalize(new_d)
                     d = new_d
 
-                    # Jones-Mueller for reflection
                     a_m = 0.5 * (r_s * r_s + r_p * r_p)
                     b_m = 0.5 * (r_s * r_s - r_p * r_p)
                     c_m = r_s * r_p
@@ -401,9 +406,8 @@ class WarpTracer:
         else:
             self.warp_device = "cpu"
 
-        # ---- 确保 Warp 已初始化 ----
-        if not wp.is_initialized():
-            wp.init()
+        # ---- 确保 Warp 已初始化（wp.init() 幂等，不需要 is_initialized 检查） ----
+        wp.init()
 
         # ---- 转 numpy ----
         verts_np = vertices.detach().cpu().numpy().astype(np.float32)
@@ -456,6 +460,30 @@ class WarpTracer:
     def trace(self, ray_dict, max_steps=50, ds_init=0.02, ds_min=1e-3,
               ds_max=0.1, rk_tol=1e-4, fresnel=True, verbose=False,
               surface_model=None, rr_threshold=0.0, seed=42):
+        """
+        追踪光线。
+
+        Args:
+            ray_dict: generate_rays() 的输出
+            max_steps: 最大步数
+            fresnel: legacy flag；surface_model=None 时生效
+            surface_model: "fresnel" | "custom" | "coated"
+            seed: 随机种子
+            其他参数忽略（保留接口兼容性）
+
+        Returns:
+            dict，键与 AdvancedRayTracerPBRTGPU.trace 一致。
+        """
+        # ---- 解析 surface_model（与 PyTorch 版本语义一致） ----
+        if surface_model is None:
+            surface_model = "coated" if fresnel else "custom"
+        if surface_model not in ("fresnel", "custom", "coated"):
+            raise ValueError(
+                f"surface_model must be 'fresnel', 'custom', or 'coated', "
+                f"got '{surface_model}'")
+        model_map = {"fresnel": 0, "custom": 1, "coated": 2}
+        surface_model_flag = model_map[surface_model]
+
         origins = ray_dict["origins"].to(self.device).contiguous().float()
         dirs = ray_dict["dirs"].to(self.device).contiguous().float()
         stokes = ray_dict["stokes"].to(self.device).contiguous().float()
@@ -496,6 +524,7 @@ class WarpTracer:
                 np.float32(1e-4),
                 np.float32(1e10),
                 int(seed),
+                int(surface_model_flag),     # ★ 新增
             ],
             device=self.warp_device,
         )
@@ -513,7 +542,7 @@ class WarpTracer:
         n2_t = wp.to_torch(wp_n2).clone().unsqueeze(-1)
         dop_t = wp.to_torch(wp_dop).clone().unsqueeze(-1)
 
-        # energy_conserved: 简化为 True（Warp 版本保证 0<=w<=1 且单调非增）
+        # energy_conserved: 简化判断
         energy_conserved = bool(
             torch.all((energy_t >= -1e-6) & (energy_t <= 1.0 + 1e-6)).item())
 
