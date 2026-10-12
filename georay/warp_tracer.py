@@ -4,7 +4,7 @@
 
 设计：
     * 每条光线 = 一个 GPU 线程
-    * 整个 trace 循环（max_steps 步）在单个 Warp 内核里完成
+    * 整个 trace 循环在单个 Warp 内核里完成
     * 无 Python per-step 循环、无 .any()/.item() 同步
     * history 预分配为固定 shape [N, S+1, ...]
 
@@ -16,14 +16,15 @@
     * 能量权重累积
     * Diffuse 半球采样
     * surface_model: "fresnel" / "custom" / "coated"
+    * ★ GRIN: 抛物线型 n(r) = n0 - A·(x² + y²) + 解析梯度
 
 自相交处理：
-    * 用内层 while 循环跳过 prev_face 和近原点命中
+    * 内层 while 循环跳过 prev_face 和近原点命中
     * 只有真正发生表面交互时才 step += 1
-    * 保证 hist_pos 记录的是真正的交互点，与 PyTorch 版本逐 step 一致
 
 限制：
-    * 不支持 GRIN 介质（后续可扩展）
+    * 只支持标量材质属性
+    * GRIN 只支持抛物线型（其他类型请用 AdvancedRayTracerPBRTGPU）
     * 不支持波长相关材质
 """
 from __future__ import annotations
@@ -85,7 +86,6 @@ def rotate_stokes_to_new_s(
     S1: wp.float32, S2: wp.float32, S3: wp.float32,
     s_old: wp.vec3, s_new: wp.vec3, d: wp.vec3,
 ):
-    """把 (S1,S2,S3) 从 s_old 基准旋转到 s_new 基准。"""
     cos_t = wp.dot(s_old, s_new)
     sin_t = wp.dot(wp.cross(s_old, s_new), d)
     cos_2t = cos_t * cos_t - sin_t * sin_t
@@ -93,6 +93,63 @@ def rotate_stokes_to_new_s(
     S1n = cos_2t * S1 + sin_2t * S2
     S2n = -sin_2t * S1 + cos_2t * S2
     return S1n, S2n, S3
+
+
+# ---------- ★ GRIN 场（抛物线型） ----------
+
+@wp.func
+def eval_grin_parabolic(
+    r: wp.vec3, n0: wp.float32, A: wp.float32
+):
+    """n(r) = n0 - A*(x² + y²)，返回 (n, grad_n)。"""
+    n = n0 - A * (r[0] * r[0] + r[1] * r[1])
+    if n < 1.0:
+        n = 1.0
+    grad = wp.vec3(-2.0 * A * r[0], -2.0 * A * r[1], 0.0)
+    return n, grad
+
+
+@wp.func
+def grin_rk4_step(
+    r: wp.vec3, d: wp.vec3,
+    n0: wp.float32, A: wp.float32,
+    ds: wp.float32,
+):
+    """单步 RK4。返回 (r_next, d_next, n_next)。"""
+    # Stage 1
+    n1, g1 = eval_grin_parabolic(r, n0, A)
+    p1 = n1 * d
+    dr1 = p1 / n1
+    dp1 = g1
+
+    # Stage 2
+    r2 = r + 0.5 * ds * dr1
+    p2 = p1 + 0.5 * ds * dp1
+    n2, g2 = eval_grin_parabolic(r2, n0, A)
+    dr2 = p2 / n2
+    dp2 = g2
+
+    # Stage 3
+    r3 = r + 0.5 * ds * dr2
+    p3 = p1 + 0.5 * ds * dp2
+    n3, g3 = eval_grin_parabolic(r3, n0, A)
+    dr3 = p3 / n3
+    dp3 = g3
+
+    # Stage 4
+    r4 = r + ds * dr3
+    p4 = p1 + ds * dp3
+    n4, g4 = eval_grin_parabolic(r4, n0, A)
+    dr4 = p4 / n4
+    dp4 = g4
+
+    # Combine
+    r_next = r + (ds / 6.0) * (dr1 + 2.0 * dr2 + 2.0 * dr3 + dr4)
+    p_next = p1 + (ds / 6.0) * (dp1 + 2.0 * dp2 + 2.0 * dp3 + dp4)
+    n_next, _ = eval_grin_parabolic(r_next, n0, A)
+    d_next = p_next / n_next
+    d_next = wp.normalize(d_next)
+    return r_next, d_next, n_next
 
 
 # ==============================================================================
@@ -106,18 +163,22 @@ def trace_kernel(
     tri_v0: wp.array(dtype=wp.vec3),
     tri_v1: wp.array(dtype=wp.vec3),
     tri_v2: wp.array(dtype=wp.vec3),
-    face_materials: wp.array(dtype=wp.int32, ndim=2),   # [M, 2]
+    face_materials: wp.array(dtype=wp.int32, ndim=2),
     # material tables
     mat_n: wp.array(dtype=wp.float32),
     mat_r: wp.array(dtype=wp.float32),
     mat_d: wp.array(dtype=wp.float32),
     mat_a: wp.array(dtype=wp.float32),
+    # ★ GRIN tables (按 medium_id 索引)
+    grin_kind: wp.array(dtype=wp.int32),      # 0=none, 1=parabolic
+    grin_n0: wp.array(dtype=wp.float32),
+    grin_A: wp.array(dtype=wp.float32),
     # rays in
     ray_origins: wp.array(dtype=wp.vec3),
     ray_dirs: wp.array(dtype=wp.vec3),
     ray_stokes: wp.array(dtype=wp.vec4),
     # history out
-    hist_pos: wp.array(dtype=wp.vec3, ndim=2),          # [N, S+1]
+    hist_pos: wp.array(dtype=wp.vec3, ndim=2),
     hist_stokes: wp.array(dtype=wp.vec4, ndim=2),
     hist_energy: wp.array(dtype=wp.float32, ndim=2),
     hist_active: wp.array(dtype=wp.int32, ndim=2),
@@ -132,7 +193,9 @@ def trace_kernel(
     eps: wp.float32,
     far: wp.float32,
     seed: wp.int32,
-    surface_model_flag: wp.int32,   # 0=fresnel, 1=custom, 2=coated
+    surface_model_flag: wp.int32,
+    ds_init: wp.float32,
+    num_media: wp.int32,
 ):
     tid = wp.tid()
 
@@ -148,6 +211,7 @@ def trace_kernel(
     medium_id = wp.int32(0)
     prev_face = wp.int32(-1)
     s_ref = choose_perpendicular(d)
+    ds = ds_init
 
     rng = wp.rand_init(seed, tid)
 
@@ -166,235 +230,265 @@ def trace_kernel(
     step = wp.int32(0)
 
     while active == 1 and step < max_steps:
-        # ============================================================
-        # ★ 内层循环：跳过自相交，直到找到有效命中或确认逃逸
-        # ============================================================
+        # ---------- 1. 求交 ----------
         q = wp.mesh_query_ray(mesh_id, origin, d, far)
-        skip_guard = wp.int32(0)
 
-        while skip_guard < 8:
-            if not q.result:
-                break                            # 逃逸
-            if q.t > eps and q.face != prev_face:
-                break                            # 有效命中，跳出
-            # 无效命中：推一点再试
-            origin = origin + d * (q.t + eps)
-            q = wp.mesh_query_ray(mesh_id, origin, d, far)
-            skip_guard = skip_guard + 1
+        # ---------- 判断当前介质是否 GRIN ----------
+        g_active = wp.int32(0)
+        g_n0 = wp.float32(1.0)
+        g_A = wp.float32(0.0)
+        if medium_id >= 0 and medium_id < num_media:
+            if grin_kind[medium_id] == 1:
+                g_active = wp.int32(1)
+                g_n0 = grin_n0[medium_id]
+                g_A = grin_A[medium_id]
 
-        # ============================================================
-        # 处理有效结果
-        # ============================================================
-        cur_refl = wp.float32(0.0)
-        cur_trans = wp.float32(0.0)
-        cur_abs = wp.float32(0.0)
-        cur_n1 = wp.float32(1.0)
-        cur_n2 = wp.float32(1.0)
+        # ---------- 决策：GRIN 步进 vs 表面交互 ----------
+        if g_active == 1 and ((not q.result) or q.t > ds):
+            # ============================================================
+            # ★ GRIN RK4 步进
+            # ============================================================
+            new_origin, new_d, new_n = grin_rk4_step(
+                origin, d, g_n0, g_A, ds)
 
-        if not q.result:
-            # ---------- 逃逸 ----------
-            origin = origin + d * 1.0
-            active = wp.int32(0)
-        else:
-            t_hit = q.t
-            face_idx = q.face
-            hit_pt = origin + d * t_hit
-            origin = hit_pt
-
-            # ---------- 面法线 ----------
-            v0 = tri_v0[face_idx]
-            v1 = tri_v1[face_idx]
-            v2 = tri_v2[face_idx]
-            normal = compute_face_normal(v0, v1, v2)
-
-            cos_raw = -wp.dot(d, normal)
-            is_front = cos_raw > 0.0
-            if not is_front:
-                normal = -normal
-            cos_i = wp.abs(cos_raw)
-            if cos_i > 1.0:
-                cos_i = 1.0
-            if cos_i < 1e-6:
-                cos_i = 1e-6
-
-            # ---------- 材质 ----------
-            mat_front = face_materials[face_idx, 0]
-            mat_back = face_materials[face_idx, 1]
-            n1_id = mat_front
-            n2_id = mat_back
-            if not is_front:
-                n1_id = mat_back
-                n2_id = mat_front
-
-            n1 = mat_n[n1_id]
-            n2 = mat_n[n2_id]
-            if n1 < 1.0:
-                n1 = 1.0
-            if n2 < 1.0:
-                n2 = 1.0
-
-            custom_refl = mat_r[n2_id]
-            custom_diff = mat_d[n2_id]
-            custom_abs = mat_a[n2_id]
-
-            cur_n1 = n1
-            cur_n2 = n2
-
-            # ---------- 入射面 s 基准 ----------
-            cross_plane = wp.cross(d, normal)
-            ln_plane = wp.length(cross_plane)
-            s_plane = s_ref
-            if ln_plane > 1e-8:
-                s_plane = cross_plane / ln_plane
-
-            S1p, S2p, S3p = rotate_stokes_to_new_s(
-                S1, S2, S3, s_ref, s_plane, d)
-
-            # ---------- Fresnel ----------
-            r_s, r_p, cos_t_f, is_tir_i = fresnel_rs_rp(n1, n2, cos_i)
-            is_tir = (is_tir_i == 1)
-            R_s = r_s * r_s
-            R_p = r_p * r_p
-
-            w_s = 0.5 * (1.0 + S1p)
-            w_p = 0.5 * (1.0 - S1p)
-            R_eff = w_s * R_s + w_p * R_p
-
-            # surface_model: 0=fresnel, 1=custom, 2=coated
-            specular_R = R_eff
-            if surface_model_flag == 1:
-                specular_R = custom_refl
-            elif surface_model_flag == 2:
-                specular_R = R_eff * custom_refl
-            if is_tir:
-                specular_R = 1.0
-
-            P_absorb = wp.clamp(custom_abs, 0.0, 1.0)
-            P_diffuse = (1.0 - P_absorb) * wp.clamp(custom_diff, 0.0, 1.0)
-            P_specular = (1.0 - P_absorb - P_diffuse) * wp.clamp(specular_R, 0.0, 1.0)
-            P_refract = 1.0 - P_absorb - P_diffuse - P_specular
-            if P_refract < 0.0:
-                P_refract = 0.0
-
-            total_P = P_absorb + P_diffuse + P_specular + P_refract
-            if total_P < 1e-12:
-                total_P = 1e-12
-            P_absorb = P_absorb / total_P
-            P_diffuse = P_diffuse / total_P
-            P_specular = P_specular / total_P
-            P_refract = P_refract / total_P
-
-            cur_refl = P_specular + P_diffuse
-            cur_trans = P_refract
-            cur_abs = P_absorb
-
-            # ---------- Monte Carlo 分支 ----------
-            r = wp.randf(rng)
-
-            if r < P_absorb:
-                # 吸收
-                weight = 0.0
-                active = wp.int32(0)
-
-            elif r < P_absorb + P_diffuse:
-                # 漫反射
-                weight = weight * P_diffuse
-
-                r_sq = wp.randf(rng)
-                sin_theta = wp.sqrt(r_sq)
-                cos_theta = wp.sqrt(1.0 - r_sq)
-                phi = 6.283185307179586 * wp.randf(rng)
-
-                ref_v = wp.vec3(0.0, 0.0, 1.0)
-                if wp.abs(normal[2]) > 0.999:
-                    ref_v = wp.vec3(0.0, 1.0, 0.0)
-                local_u = wp.cross(ref_v, normal)
-                lu = wp.length(local_u)
-                if lu > 1e-12:
-                    local_u = local_u / lu
-                local_v = wp.cross(normal, local_u)
-
-                new_d = (sin_theta * wp.cos(phi) * local_u
-                         + sin_theta * wp.sin(phi) * local_v
-                         + cos_theta * normal)
-                new_d = wp.normalize(new_d)
-                d = new_d
-                S1 = 0.0
-                S2 = 0.0
-                S3 = 0.0
-                s_ref = choose_perpendicular(d)
-                medium_id = n1_id
-
-            elif r < P_absorb + P_diffuse + P_specular:
-                # 镜面反射
-                weight = weight * P_specular
-
-                new_d = d + 2.0 * cos_i * normal
-                new_d = wp.normalize(new_d)
-                d = new_d
-
-                a_m = 0.5 * (r_s * r_s + r_p * r_p)
-                b_m = 0.5 * (r_s * r_s - r_p * r_p)
-                c_m = r_s * r_p
-                S0n = a_m * 1.0 + b_m * S1p
-                S1n = b_m * 1.0 + a_m * S1p
-                S2n = c_m * S2p
-                S3n = c_m * S3p
-                if S0n < 1e-12:
-                    S0n = 1e-12
-                S1 = S1n / S0n
-                S2 = S2n / S0n
-                S3 = S3n / S0n
-                s_ref = s_plane
-                medium_id = n1_id
-
+            # 更新 s_ref 保持与 d 垂直
+            s_proj = wp.dot(s_ref, new_d)
+            s_new = s_ref - s_proj * new_d
+            s_new_len = wp.length(s_new)
+            if s_new_len < 1e-12:
+                s_new = choose_perpendicular(new_d)
             else:
-                # 折射
-                weight = weight * P_refract
+                s_new = s_new / s_new_len
 
-                eta = n1 / n2
-                new_d = eta * d + (eta * cos_i - cos_t_f) * normal
-                new_d = wp.normalize(new_d)
-                d = new_d
+            # 旋转 stokes 到新基准
+            S1n, S2n, S3n = rotate_stokes_to_new_s(
+                S1, S2, S3, s_ref, s_new, new_d)
+            S1 = S1n
+            S2 = S2n
+            S3 = S3n
+            s_ref = s_new
 
-                denom_s = n1 * cos_i + n2 * cos_t_f + 1e-12
-                denom_p = n2 * cos_i + n1 * cos_t_f + 1e-12
-                t_s = 2.0 * n1 * cos_i / denom_s
-                t_p = 2.0 * n1 * cos_i / denom_p
+            origin = new_origin
+            d = new_d
 
-                a_t = 0.5 * (t_s * t_s + t_p * t_p)
-                b_t = 0.5 * (t_s * t_s - t_p * t_p)
-                c_t = t_s * t_p
-                S0n = a_t * 1.0 + b_t * S1p
-                S1n = b_t * 1.0 + a_t * S1p
-                S2n = c_t * S2p
-                S3n = c_t * S3p
-                if S0n < 1e-12:
-                    S0n = 1e-12
-                S1 = S1n / S0n
-                S2 = S2n / S0n
-                S3 = S3n / S0n
-                s_ref = s_plane
-                medium_id = n2_id
+            step = step + 1
+            hist_pos[tid, step] = origin
+            hist_stokes[tid, step] = wp.vec4(1.0, S1, S2, S3)
+            hist_energy[tid, step] = weight
+            hist_active[tid, step] = active
+            hist_refl[tid, step] = 0.0
+            hist_trans[tid, step] = 0.0
+            hist_abs[tid, step] = 0.0
+            hist_n1[tid, step] = new_n
+            hist_n2[tid, step] = new_n
+            hist_dop[tid, step] = wp.sqrt(S1 * S1 + S2 * S2 + S3 * S3) / (1.0 + 1e-12)
 
-            prev_face = face_idx
+        else:
+            # ============================================================
+            # 表面交互（或逃逸）
+            # ============================================================
+            # 跳过自相交
+            skip_guard = wp.int32(0)
+            while skip_guard < 8:
+                if not q.result:
+                    break
+                if q.t > eps and q.face != prev_face:
+                    break
+                origin = origin + d * (q.t + eps)
+                q = wp.mesh_query_ray(mesh_id, origin, d, far)
+                skip_guard = skip_guard + 1
 
-        # ============================================================
-        # 记录本步（只有走到这里才是真正的交互步）
-        # ============================================================
-        step = step + 1
-        hist_pos[tid, step] = origin
-        hist_stokes[tid, step] = wp.vec4(1.0, S1, S2, S3)
-        hist_energy[tid, step] = weight
-        hist_active[tid, step] = active
-        hist_refl[tid, step] = cur_refl
-        hist_trans[tid, step] = cur_trans
-        hist_abs[tid, step] = cur_abs
-        hist_n1[tid, step] = cur_n1
-        hist_n2[tid, step] = cur_n2
-        hist_dop[tid, step] = wp.sqrt(S1 * S1 + S2 * S2 + S3 * S3) / (1.0 + 1e-12)
+            cur_refl = wp.float32(0.0)
+            cur_trans = wp.float32(0.0)
+            cur_abs = wp.float32(0.0)
+            cur_n1 = wp.float32(1.0)
+            cur_n2 = wp.float32(1.0)
 
-    # ---------- 补全剩余步 ----------
+            if not q.result:
+                origin = origin + d * 1.0
+                active = wp.int32(0)
+            else:
+                t_hit = q.t
+                face_idx = q.face
+                origin = origin + d * t_hit
+
+                v0 = tri_v0[face_idx]
+                v1 = tri_v1[face_idx]
+                v2 = tri_v2[face_idx]
+                normal = compute_face_normal(v0, v1, v2)
+
+                cos_raw = -wp.dot(d, normal)
+                is_front = cos_raw > 0.0
+                if not is_front:
+                    normal = -normal
+                cos_i = wp.abs(cos_raw)
+                if cos_i > 1.0:
+                    cos_i = 1.0
+                if cos_i < 1e-6:
+                    cos_i = 1e-6
+
+                mat_front = face_materials[face_idx, 0]
+                mat_back = face_materials[face_idx, 1]
+                n1_id = mat_front
+                n2_id = mat_back
+                if not is_front:
+                    n1_id = mat_back
+                    n2_id = mat_front
+
+                # ---- 折射率：如果在 GRIN 介质内用局域 n ----
+                if g_active == 1:
+                    n_local, _ = eval_grin_parabolic(origin, g_n0, g_A)
+                    if is_front:
+                        n1 = n_local
+                        n2 = mat_n[n2_id]
+                    else:
+                        n1 = mat_n[n1_id]
+                        n2 = n_local
+                else:
+                    n1 = mat_n[n1_id]
+                    n2 = mat_n[n2_id]
+
+                if n1 < 1.0:
+                    n1 = 1.0
+                if n2 < 1.0:
+                    n2 = 1.0
+
+                custom_refl = mat_r[n2_id]
+                custom_diff = mat_d[n2_id]
+                custom_abs = mat_a[n2_id]
+
+                cur_n1 = n1
+                cur_n2 = n2
+
+                cross_plane = wp.cross(d, normal)
+                ln_plane = wp.length(cross_plane)
+                s_plane = s_ref
+                if ln_plane > 1e-8:
+                    s_plane = cross_plane / ln_plane
+
+                S1p, S2p, S3p = rotate_stokes_to_new_s(
+                    S1, S2, S3, s_ref, s_plane, d)
+
+                r_s, r_p, cos_t_f, is_tir_i = fresnel_rs_rp(n1, n2, cos_i)
+                is_tir = (is_tir_i == 1)
+                R_s = r_s * r_s
+                R_p = r_p * r_p
+
+                w_s = 0.5 * (1.0 + S1p)
+                w_p = 0.5 * (1.0 - S1p)
+                R_eff = w_s * R_s + w_p * R_p
+
+                specular_R = R_eff
+                if surface_model_flag == 1:
+                    specular_R = custom_refl
+                elif surface_model_flag == 2:
+                    specular_R = R_eff * custom_refl
+                if is_tir:
+                    specular_R = 1.0
+
+                P_absorb = wp.clamp(custom_abs, 0.0, 1.0)
+                P_diffuse = (1.0 - P_absorb) * wp.clamp(custom_diff, 0.0, 1.0)
+                P_specular = (1.0 - P_absorb - P_diffuse) * wp.clamp(specular_R, 0.0, 1.0)
+                P_refract = 1.0 - P_absorb - P_diffuse - P_specular
+                if P_refract < 0.0:
+                    P_refract = 0.0
+
+                total_P = P_absorb + P_diffuse + P_specular + P_refract
+                if total_P < 1e-12:
+                    total_P = 1e-12
+                P_absorb = P_absorb / total_P
+                P_diffuse = P_diffuse / total_P
+                P_specular = P_specular / total_P
+                P_refract = P_refract / total_P
+
+                cur_refl = P_specular + P_diffuse
+                cur_trans = P_refract
+                cur_abs = P_absorb
+
+                r = wp.randf(rng)
+
+                if r < P_absorb:
+                    weight = 0.0
+                    active = wp.int32(0)
+                elif r < P_absorb + P_diffuse:
+                    weight = weight * P_diffuse
+                    r_sq = wp.randf(rng)
+                    sin_theta = wp.sqrt(r_sq)
+                    cos_theta = wp.sqrt(1.0 - r_sq)
+                    phi = 6.283185307179586 * wp.randf(rng)
+                    ref_v = wp.vec3(0.0, 0.0, 1.0)
+                    if wp.abs(normal[2]) > 0.999:
+                        ref_v = wp.vec3(0.0, 1.0, 0.0)
+                    local_u = wp.cross(ref_v, normal)
+                    lu = wp.length(local_u)
+                    if lu > 1e-12:
+                        local_u = local_u / lu
+                    local_v = wp.cross(normal, local_u)
+                    new_d = (sin_theta * wp.cos(phi) * local_u
+                             + sin_theta * wp.sin(phi) * local_v
+                             + cos_theta * normal)
+                    d = wp.normalize(new_d)
+                    S1 = 0.0
+                    S2 = 0.0
+                    S3 = 0.0
+                    s_ref = choose_perpendicular(d)
+                    medium_id = n1_id
+                elif r < P_absorb + P_diffuse + P_specular:
+                    weight = weight * P_specular
+                    new_d = d + 2.0 * cos_i * normal
+                    d = wp.normalize(new_d)
+                    a_m = 0.5 * (r_s * r_s + r_p * r_p)
+                    b_m = 0.5 * (r_s * r_s - r_p * r_p)
+                    c_m = r_s * r_p
+                    S0n = a_m * 1.0 + b_m * S1p
+                    S1n = b_m * 1.0 + a_m * S1p
+                    S2n = c_m * S2p
+                    S3n = c_m * S3p
+                    if S0n < 1e-12:
+                        S0n = 1e-12
+                    S1 = S1n / S0n
+                    S2 = S2n / S0n
+                    S3 = S3n / S0n
+                    s_ref = s_plane
+                    medium_id = n1_id
+                else:
+                    weight = weight * P_refract
+                    eta = n1 / n2
+                    new_d = eta * d + (eta * cos_i - cos_t_f) * normal
+                    d = wp.normalize(new_d)
+                    denom_s = n1 * cos_i + n2 * cos_t_f + 1e-12
+                    denom_p = n2 * cos_i + n1 * cos_t_f + 1e-12
+                    t_s = 2.0 * n1 * cos_i / denom_s
+                    t_p = 2.0 * n1 * cos_i / denom_p
+                    a_t = 0.5 * (t_s * t_s + t_p * t_p)
+                    b_t = 0.5 * (t_s * t_s - t_p * t_p)
+                    c_t = t_s * t_p
+                    S0n = a_t * 1.0 + b_t * S1p
+                    S1n = b_t * 1.0 + a_t * S1p
+                    S2n = c_t * S2p
+                    S3n = c_t * S3p
+                    if S0n < 1e-12:
+                        S0n = 1e-12
+                    S1 = S1n / S0n
+                    S2 = S2n / S0n
+                    S3 = S3n / S0n
+                    s_ref = s_plane
+                    medium_id = n2_id
+
+                prev_face = face_idx
+
+            step = step + 1
+            hist_pos[tid, step] = origin
+            hist_stokes[tid, step] = wp.vec4(1.0, S1, S2, S3)
+            hist_energy[tid, step] = weight
+            hist_active[tid, step] = active
+            hist_refl[tid, step] = cur_refl
+            hist_trans[tid, step] = cur_trans
+            hist_abs[tid, step] = cur_abs
+            hist_n1[tid, step] = cur_n1
+            hist_n2[tid, step] = cur_n2
+            hist_dop[tid, step] = wp.sqrt(S1 * S1 + S2 * S2 + S3 * S3) / (1.0 + 1e-12)
+
     while step < max_steps:
         step = step + 1
         hist_pos[tid, step] = origin
@@ -414,49 +508,52 @@ def trace_kernel(
 # ==============================================================================
 
 class WarpTracer:
-    """全 Warp 内核实现的 tracer，接口与 AdvancedRayTracerPBRTGPU 兼容。"""
+    """全 Warp 内核实现的 tracer，接口与 AdvancedRayTracerPBRTGPU 兼容。
+
+    支持 GRIN（抛物线型）：materials[mat_id]["grin_field"] 可以是 dict：
+        {"type": "parabolic", "n0": 1.5, "A": 0.1}
+    此时该材质的折射率场内满足 n(r) = n0 - A*(x² + y²)。
+    """
 
     def __init__(self, vertices, faces, face_materials, materials_cfg, device):
         self.device = device
-        if str(device).startswith("cuda"):
-            self.warp_device = "cuda:0"
-        else:
-            self.warp_device = "cpu"
+        self.warp_device = "cuda:0" if str(device).startswith("cuda") else "cpu"
 
-        # wp.init() 幂等，可重复调用
         wp.init()
 
         verts_np = vertices.detach().cpu().numpy().astype(np.float32)
         faces_np = faces.detach().cpu().numpy().astype(np.int32).flatten()
 
-        # 构建 Warp mesh
         self.mesh = wp.Mesh(
             points=wp.array(verts_np, dtype=wp.vec3, device=self.warp_device),
             indices=wp.array(faces_np, dtype=wp.int32, device=self.warp_device),
         )
         self.mesh_id = self.mesh.id
 
-        # 三角形顶点
         faces_long = faces.detach().cpu().numpy().astype(np.int64)
         tris = verts_np[faces_long]
-        self.tri_v0 = wp.array(np.ascontiguousarray(tris[:, 0]).astype(np.float32),
+        self.tri_v0 = wp.array(np.ascontiguousarray(tris[:, 0]),
                                dtype=wp.vec3, device=self.warp_device)
-        self.tri_v1 = wp.array(np.ascontiguousarray(tris[:, 1]).astype(np.float32),
+        self.tri_v1 = wp.array(np.ascontiguousarray(tris[:, 1]),
                                dtype=wp.vec3, device=self.warp_device)
-        self.tri_v2 = wp.array(np.ascontiguousarray(tris[:, 2]).astype(np.float32),
+        self.tri_v2 = wp.array(np.ascontiguousarray(tris[:, 2]),
                                dtype=wp.vec3, device=self.warp_device)
 
-        # face_materials
         fm_np = face_materials.detach().cpu().numpy().astype(np.int32)
         self.face_materials = wp.array(fm_np, dtype=wp.int32, ndim=2,
                                         device=self.warp_device)
 
-        # 材质标量表
         max_mat = max(materials_cfg.keys()) + 1
         n_arr = np.ones(max_mat, dtype=np.float32)
         r_arr = np.zeros(max_mat, dtype=np.float32)
         d_arr = np.zeros(max_mat, dtype=np.float32)
         a_arr = np.zeros(max_mat, dtype=np.float32)
+
+        # ★ GRIN 表
+        grin_kind_arr = np.zeros(max_mat, dtype=np.int32)
+        grin_n0_arr = np.ones(max_mat, dtype=np.float32)
+        grin_A_arr = np.zeros(max_mat, dtype=np.float32)
+
         for k, cfg in materials_cfg.items():
             v_n = cfg.get("n", 1.0)
             if not isinstance(v_n, (int, float)):
@@ -468,16 +565,31 @@ class WarpTracer:
             d_arr[k] = float(cfg.get("diffuse", 0.0))
             a_arr[k] = float(cfg.get("absorptivity", 0.0))
 
+            # 解析 grin_field
+            gf = cfg.get("grin_field", None)
+            if gf is not None:
+                if isinstance(gf, dict) and gf.get("type") == "parabolic":
+                    grin_kind_arr[k] = 1
+                    grin_n0_arr[k] = float(gf.get("n0", v_n))
+                    grin_A_arr[k] = float(gf.get("A", 0.0))
+                else:
+                    raise NotImplementedError(
+                        f"WarpTracer only supports parabolic GRIN field, "
+                        f"got {gf}. Use AdvancedRayTracerPBRTGPU for other types.")
+
         self.mat_n = wp.array(n_arr, dtype=wp.float32, device=self.warp_device)
         self.mat_r = wp.array(r_arr, dtype=wp.float32, device=self.warp_device)
         self.mat_d = wp.array(d_arr, dtype=wp.float32, device=self.warp_device)
         self.mat_a = wp.array(a_arr, dtype=wp.float32, device=self.warp_device)
+        self.grin_kind = wp.array(grin_kind_arr, dtype=wp.int32, device=self.warp_device)
+        self.grin_n0 = wp.array(grin_n0_arr, dtype=wp.float32, device=self.warp_device)
+        self.grin_A = wp.array(grin_A_arr, dtype=wp.float32, device=self.warp_device)
+        self.num_media = max_mat
 
     def trace(self, ray_dict, max_steps=50, ds_init=0.02, ds_min=1e-3,
               ds_max=0.1, rk_tol=1e-4, fresnel=True, verbose=False,
               surface_model=None, rr_threshold=0.0, seed=42):
         """追踪光线。接口与 AdvancedRayTracerPBRTGPU.trace 一致。"""
-        # 解析 surface_model
         if surface_model is None:
             surface_model = "coated" if fresnel else "custom"
         if surface_model not in ("fresnel", "custom", "coated"):
@@ -517,6 +629,7 @@ class WarpTracer:
                 self.tri_v0, self.tri_v1, self.tri_v2,
                 self.face_materials,
                 self.mat_n, self.mat_r, self.mat_d, self.mat_a,
+                self.grin_kind, self.grin_n0, self.grin_A,
                 wp_origins, wp_dirs, wp_stokes,
                 wp_pos, wp_stokes_hist, wp_energy, wp_active,
                 wp_refl, wp_trans, wp_abs, wp_n1, wp_n2, wp_dop,
@@ -525,6 +638,8 @@ class WarpTracer:
                 np.float32(1e10),
                 int(seed),
                 int(surface_model_flag),
+                np.float32(ds_init),
+                int(self.num_media),
             ],
             device=self.warp_device,
         )
