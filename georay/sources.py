@@ -8,10 +8,29 @@ from .polarization import _choose_perpendicular
 def generate_rays(source_type="grid", num_rays=100, origin=(0, 0, 0),
                   direction=(0, 0, 1), radius=1.0, angle_deg=10.0,
                   bounds=(-1, 1, -1, 1), mesh=None, polarization="random",
-                  wavelength_nm=550.0, device=torch.device("cpu")):
+                  wavelength_nm=550.0, device=torch.device("cpu"),
+                  medium_id=0):
     """Generate rays of various source types.
 
-    与之前相同，仅 grid 单点采样修正。
+    Args:
+        source_type: "grid", "random", "point_source", "area_source", or "mesh_source".
+        num_rays: number of rays (rounded to square for grid).
+        origin: source center (x, y, z).
+        direction: main propagation direction.
+        radius: radius for random source.
+        angle_deg: cone half-angle for point_source.
+        bounds: (xmin, xmax, ymin, ymax) for grid/area_source.
+        mesh: trimesh.Trimesh for mesh_source.
+        polarization: "s", "p", "random", or angle in degrees.
+        wavelength_nm: wavelength in nanometers.
+        device: torch device.
+        medium_id: initial medium ID for all rays (default 0 = air/vacuum).
+            Set to a non-zero value for rays starting inside a dielectric
+            or GRIN medium.
+
+    Returns:
+        dict with keys: origins, dirs, wavelengths, stokes, s_ref, p_ref,
+                        ray_ids, medium_ids.
     """
     main_dir = torch.tensor(direction, dtype=torch.float32, device=device)
     main_dir = main_dir / torch.norm(main_dir)
@@ -118,6 +137,15 @@ def generate_rays(source_type="grid", num_rays=100, origin=(0, 0, 0),
     s_ref = _choose_perpendicular(dirs)
     p_ref = torch.cross(dirs, s_ref, dim=-1)
 
+    # ★ 每条光线的初始介质 ID
+    if isinstance(medium_id, (list, tuple)):
+        medium_ids_t = torch.tensor(medium_id, dtype=torch.long, device=device)
+        assert medium_ids_t.shape[0] == num_rays, \
+            "medium_id list length must match num_rays"
+    else:
+        medium_ids_t = torch.full((num_rays,), int(medium_id),
+                                   dtype=torch.long, device=device)
+
     return {
         "origins": origins,
         "dirs": dirs,
@@ -126,4 +154,5 @@ def generate_rays(source_type="grid", num_rays=100, origin=(0, 0, 0),
         "s_ref": s_ref,
         "p_ref": p_ref,
         "ray_ids": torch.arange(num_rays, dtype=torch.long, device=device),
+        "medium_ids": medium_ids_t,
     }

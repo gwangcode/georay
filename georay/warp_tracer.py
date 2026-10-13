@@ -652,6 +652,7 @@ def trace_kernel(
     ray_dirs: wp.array(dtype=wp.vec3),
     ray_stokes: wp.array(dtype=wp.vec4),
     ray_wavelengths: wp.array(dtype=wp.float32),
+    ray_medium_ids: wp.array(dtype=wp.int32),
     hist_pos: wp.array(dtype=wp.vec3, ndim=2),
     hist_stokes: wp.array(dtype=wp.vec4, ndim=2),
     hist_energy: wp.array(dtype=wp.float32, ndim=2),
@@ -681,7 +682,7 @@ def trace_kernel(
     wl = ray_wavelengths[tid]
     weight = wp.float32(1.0)
     active = wp.int32(1)
-    medium_id = wp.int32(0)
+    medium_id = ray_medium_ids[tid]
     prev_face = wp.int32(-1)
     s_ref = choose_perpendicular(d)
     ds = ds_init
@@ -1476,6 +1477,22 @@ class WarpTracer:
         dirs = ray_dict["dirs"].to(self.device).contiguous().float()
         stokes = ray_dict["stokes"].to(self.device).contiguous().float()
         wavelengths = ray_dict["wavelengths"].to(self.device).contiguous().float().squeeze(-1)
+        # ★ 支持 ray_dict["medium_ids"]
+        if "medium_ids" in ray_dict:
+            mid = ray_dict["medium_ids"]
+            if isinstance(mid, int):
+                medium_ids_t = torch.full((N,), int(mid), dtype=torch.int32,
+                                            device=self.device)
+            else:
+                medium_ids_t = mid.to(dtype=torch.int32, device=self.device).contiguous()
+                if medium_ids_t.shape[0] != N:
+                    raise ValueError(
+                        f"ray_dict['medium_ids'] length {medium_ids_t.shape[0]} "
+                        f"does not match number of rays {N}")
+        else:
+            medium_ids_t = torch.zeros(N, dtype=torch.int32, device=self.device)
+
+        wp_medium_ids = wp.from_torch(medium_ids_t, dtype=wp.int32)
 
         N = origins.shape[0]
         S = max_steps + 1
@@ -1513,6 +1530,7 @@ class WarpTracer:
                 self.gz, self.gz_offset, self.gz_size,
                 self.grin_kind, self.grin_n0, self.grin_A,
                 wp_origins, wp_dirs, wp_stokes, wp_wl,
+                wp_medium_ids,
                 wp_pos, wp_stokes_hist, wp_energy, wp_active,
                 wp_refl, wp_trans, wp_abs, wp_n1, wp_n2, wp_dop,
                 max_steps,
