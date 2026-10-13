@@ -10,7 +10,12 @@ from georay.grating import grating_angle, angular_dispersion
 
 
 def test_grating_equation_zero_order():
-    """零级衍射方向等于镜面反射方向。"""
+    """
+    零级衍射方向等于镜面反射方向：θ_0 = -θ_i。
+
+    ★ 修复：原测试断言 θ_0 = θ_i，物理错误。
+       光栅方程：sin(θ_0) = -sin(θ_i) → θ_0 = -θ_i
+    """
     wl = 550.0
     period = 1000.0
     theta_i = math.radians(30.0)
@@ -21,7 +26,9 @@ def test_grating_equation_zero_order():
     print("\n[Test 1] Zero-order diffraction")
     print("  θi = 30°, θ_0 = {:.4f}°".format(math.degrees(theta_0)))
 
-    assert abs(math.degrees(theta_0) - math.degrees(theta_i)) < 1e-4
+    # ★ 修复：零级方向 = -θi（镜面反射）
+    assert abs(math.degrees(theta_0) + math.degrees(theta_i)) < 1e-4, \
+        "Zero-order should be mirror reflection: θ_0 = -θi"
 
 
 def test_grating_equation_first_order():
