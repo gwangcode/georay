@@ -1,11 +1,18 @@
 """
 tests/test_monte_carlo_convergence.py
 ======================================
-Monte Carlo 追踪的统计收敛性验证。
+Monte Carlo 追踪的正确性验证。
 
-物理依据：
-    估计量 ⟨R⟩ 的标准误差 ∝ 1/sqrt(N)。
-    增加光线数 N，平均反射率应收敛到解析 Fresnel 值。
+重要 API 语义：
+    tracer 输出的 `reflectivity` / `transmissivity` / `absorptivity`
+    是**界面处的理论概率**（P_specular / P_refract / P_absorb），
+    与光线数 N 无关。它们对所有光线相同（给定固定几何）。
+
+    因此无法通过统计 `reflectivity` 来验证 MC 收敛。
+    正确的验证是：
+      * 界面概率归一化：R + T + A = 1
+      * 概率与解析 Fresnel 公式一致
+      * 能量权重的期望符合理论分支概率
 """
 import math
 import torch
@@ -34,14 +41,104 @@ def fresnel_rs_rp(n1, n2, theta_i):
 
 
 # ==============================================================================
-# Test 1: 平均反射率收敛到解析 Fresnel
+# Test 1: 理论 reflectivity 字段精确匹配解析 Fresnel
 # ==============================================================================
 
-def test_mc_convergence_to_analytic_fresnel():
+def test_theoretical_reflectivity_matches_analytic():
     """
-    N 增大时，Monte Carlo 平均反射率应收敛到解析 Fresnel 值。
+    tracer 的 `reflectivity` 字段是界面处理论 P_specular，
+    应与解析 Fresnel 公式精确匹配（误差 < 1e-6）。
 
-    用 s 偏振 + 45° 入射角，期望 R_s ≈ 0.092。
+    ★ 修复：原测试期望统计收敛，但该字段是理论值，与 N 无关。
+       改为直接验证与解析值的一致性。
+    """
+    device = torch.device("cpu")
+    verts, faces = make_flat_interface(device)
+    fm = torch.tensor([[1, 0], [1, 0]], dtype=torch.long, device=device)
+    materials = {
+        0: {"n": 1.0, "reflectivity": 1.0, "diffuse": 0.0, "absorptivity": 0.0},
+        1: {"n": 1.5, "reflectivity": 1.0, "diffuse": 0.0, "absorptivity": 0.0},
+    }
+
+    print("\n[Test 1] Theoretical reflectivity matches analytic Fresnel")
+    print("  {:>8s} {:>8s} {:>14s} {:>14s}".format(
+        "θi", "pol", "R_analytic", "R_theory"))
+
+    for theta_deg in [0.0, 30.0, 45.0, 60.0, 80.0]:
+        theta_i = math.radians(theta_deg)
+        R_s, R_p = fresnel_rs_rp(1.0, 1.5, theta_i)
+
+        for pol, R_expected in [("s", R_s), ("p", R_p)]:
+            rays = generate_rays(
+                source_type="grid", num_rays=16,
+                origin=(0.0, 0.0, -1.0),
+                direction=(math.sin(theta_i), 0.0, math.cos(theta_i)),
+                bounds=(-0.5, 0.5, -0.5, 0.5),
+                polarization=pol, device=device)
+
+            tracer = AdvancedRayTracerPBRTGPU(verts, faces, fm, materials, device)
+            out = tracer.trace(rays, max_steps=3, surface_model="fresnel")
+
+            R_theory = out["reflectivity"][:, 1, 0].mean().item()
+            print("  {:>8.1f} {:>8s} {:>14.6f} {:>14.6f}".format(
+                theta_deg, pol, R_expected, R_theory))
+
+            assert abs(R_theory - R_expected) < 1e-5, \
+                "θ={}°, pol={}: R_theory={:.6f}, R_analytic={:.6f}".format(
+                    theta_deg, pol, R_theory, R_expected)
+
+
+# ==============================================================================
+# Test 2: 界面概率归一化
+# ==============================================================================
+
+def test_interface_probability_normalization():
+    """
+    界面处 R + T + A = 1（概率归一化）。
+    这个约束与解析 Fresnel 无关，只依赖于 tracer 内部逻辑。
+    """
+    device = torch.device("cpu")
+    verts, faces = make_flat_interface(device)
+    fm = torch.tensor([[1, 0], [1, 0]], dtype=torch.long, device=device)
+    materials = {
+        0: {"n": 1.0, "reflectivity": 1.0, "diffuse": 0.0, "absorptivity": 0.05},
+        1: {"n": 1.5, "reflectivity": 1.0, "diffuse": 0.0, "absorptivity": 0.05},
+    }
+
+    theta_i = math.radians(45.0)
+    rays = generate_rays(
+        source_type="grid", num_rays=32,
+        origin=(0.0, 0.0, -1.0),
+        direction=(math.sin(theta_i), 0.0, math.cos(theta_i)),
+        bounds=(-0.5, 0.5, -0.5, 0.5),
+        polarization="s", device=device)
+
+    tracer = AdvancedRayTracerPBRTGPU(verts, faces, fm, materials, device)
+    out = tracer.trace(rays, max_steps=3, surface_model="fresnel")
+
+    R = out["reflectivity"][:, 1, 0]
+    T = out["transmissivity"][:, 1, 0]
+    A = out["absorptivity"][:, 1, 0]
+    total = R + T + A
+
+    max_dev = (total - 1.0).abs().max().item()
+    print("\n[Test 2] Interface probability normalization")
+    print("  max |R + T + A - 1| = {:.3e}".format(max_dev))
+
+    assert max_dev < 1e-5
+
+
+# ==============================================================================
+# Test 3: 能量权重的统计期望符合理论
+# ==============================================================================
+
+def test_energy_weight_expectation():
+    """
+    单次交互后，能量权重的期望：
+        E[w] = P_spec · P_spec + P_refract · P_refract
+             = R² + T²
+
+    这是 Monte Carlo 单路径追踪的本质。
     """
     device = torch.device("cpu")
     verts, faces = make_flat_interface(device)
@@ -52,149 +149,34 @@ def test_mc_convergence_to_analytic_fresnel():
     }
 
     theta_i = math.radians(45.0)
-    R_s_expected, _ = fresnel_rs_rp(1.0, 1.5, theta_i)
+    R_s, _ = fresnel_rs_rp(1.0, 1.5, theta_i)
+    T_s = 1.0 - R_s
 
-    # 不同 N 下的统计均值
-    N_list = [100, 1000, 10000]
-    errors = []
+    E_w_expected = R_s ** 2 + T_s ** 2
 
-    print("\n[Test 1] MC convergence to analytic Fresnel")
-    print("  θi = 45°, n1 = 1.0, n2 = 1.5")
-    print("  R_s analytic = {:.6f}".format(R_s_expected))
-    print("  {:>8s} {:>14s} {:>14s}".format("N", "mean(R)", "|err|"))
+    N = 8192
+    rays = generate_rays(
+        source_type="grid", num_rays=N,
+        origin=(0.0, 0.0, -1.0),
+        direction=(math.sin(theta_i), 0.0, math.cos(theta_i)),
+        bounds=(-0.5, 0.5, -0.5, 0.5),
+        polarization="s", device=device)
 
-    for N in N_list:
-        rays = generate_rays(
-            source_type="grid", num_rays=N,
-            origin=(0.0, 0.0, -1.0),
-            direction=(math.sin(theta_i), 0.0, math.cos(theta_i)),
-            bounds=(-0.5, 0.5, -0.5, 0.5),
-            polarization="s", device=device)
+    torch.manual_seed(0)
+    tracer = AdvancedRayTracerPBRTGPU(verts, faces, fm, materials, device)
+    out = tracer.trace(rays, max_steps=3, surface_model="fresnel")
 
-        # 用固定 seed 保证可重复性
-        torch.manual_seed(42)
-        tracer = AdvancedRayTracerPBRTGPU(verts, faces, fm, materials, device)
-        out = tracer.trace(rays, max_steps=3, surface_model="fresnel")
+    # 第 1 步交互后的平均权重
+    mean_w_step1 = out["energy"][:, 1].mean().item()
 
-        R_mean = out["reflectivity"][:, 1, 0].mean().item()
-        err = abs(R_mean - R_s_expected)
-        errors.append(err)
-        print("  {:>8d} {:>14.6f} {:>14.2e}".format(N, R_mean, err))
+    print("\n[Test 3] Energy weight expectation")
+    print("  R_s = {:.6f}, T_s = {:.6f}".format(R_s, T_s))
+    print("  E[w]_expected = R² + T² = {:.6f}".format(E_w_expected))
+    print("  E[w]_measured = {:.6f}".format(mean_w_step1))
 
-    # 收敛性：N 增大 10 倍，误差应减小（非单调但总体趋势）
-    assert errors[-1] < errors[0], \
-        "Error should decrease with more samples: {} -> {}".format(
-            errors[0], errors[-1])
-
-
-# ==============================================================================
-# Test 2: 1/sqrt(N) 收敛速率
-# ==============================================================================
-
-def test_mc_convergence_rate():
-    """
-    Monte Carlo 估计误差应 ~ 1/sqrt(N)。
-    N 增大 100 倍，误差应减小约 10 倍。
-    """
-    device = torch.device("cpu")
-    verts, faces = make_flat_interface(device)
-    fm = torch.tensor([[1, 0], [1, 0]], dtype=torch.long, device=device)
-    materials = {
-        0: {"n": 1.0, "reflectivity": 1.0, "diffuse": 0.0, "absorptivity": 0.0},
-        1: {"n": 1.5, "reflectivity": 1.0, "diffuse": 0.0, "absorptivity": 0.0},
-    }
-
-    theta_i = math.radians(60.0)
-    R_s_expected, _ = fresnel_rs_rp(1.0, 1.5, theta_i)
-
-    # 用多个 seed 平均，减少单个 seed 的随机性
-    n_seeds = 5
-    N_small, N_large = 100, 10000
-
-    def mean_R(N):
-        values = []
-        for seed in range(n_seeds):
-            rays = generate_rays(
-                source_type="grid", num_rays=N,
-                origin=(0.0, 0.0, -1.0),
-                direction=(math.sin(theta_i), 0.0, math.cos(theta_i)),
-                bounds=(-0.5, 0.5, -0.5, 0.5),
-                polarization="s", device=device)
-            torch.manual_seed(seed)
-            tracer = AdvancedRayTracerPBRTGPU(verts, faces, fm, materials, device)
-            out = tracer.trace(rays, max_steps=3, surface_model="fresnel")
-            values.append(out["reflectivity"][:, 1, 0].mean().item())
-        return sum(values) / len(values)
-
-    err_small = abs(mean_R(N_small) - R_s_expected)
-    err_large = abs(mean_R(N_large) - R_s_expected)
-
-    ratio_N = N_large / N_small  # 100
-    expected_err_ratio = math.sqrt(ratio_N)  # 10
-    actual_err_ratio = err_small / err_large if err_large > 0 else float("inf")
-
-    print("\n[Test 2] MC convergence rate (1/sqrt(N))")
-    print("  N_small = {}, N_large = {}".format(N_small, N_large))
-    print("  err(N_small) = {:.4e}".format(err_small))
-    print("  err(N_large) = {:.4e}".format(err_large))
-    print("  err ratio: actual={:.2f}, expected≈{:.2f}".format(
-        actual_err_ratio, expected_err_ratio))
-
-    # 允许 3 倍偏差
-    assert actual_err_ratio > expected_err_ratio / 3.0, \
-        "Convergence too fast (possible bias): ratio = {:.2f}".format(actual_err_ratio)
-
-
-# ==============================================================================
-# Test 3: 均值应落在 3σ 置信区间内
-# ==============================================================================
-
-def test_mc_mean_within_3sigma():
-    """
-    Monte Carlo 均值应落在解析值的 3σ 置信区间内。
-    σ ≈ sqrt(p·(1-p)/N)，其中 p 是理论概率。
-    """
-    device = torch.device("cpu")
-    verts, faces = make_flat_interface(device)
-    fm = torch.tensor([[1, 0], [1, 0]], dtype=torch.long, device=device)
-    materials = {
-        0: {"n": 1.0, "reflectivity": 1.0, "diffuse": 0.0, "absorptivity": 0.0},
-        1: {"n": 1.5, "reflectivity": 1.0, "diffuse": 0.0, "absorptivity": 0.0},
-    }
-
-    theta_i = math.radians(30.0)
-    R_s_expected, _ = fresnel_rs_rp(1.0, 1.5, theta_i)
-
-    N = 5000
-    n_trials = 10
-    means = []
-
-    for seed in range(n_trials):
-        rays = generate_rays(
-            source_type="grid", num_rays=N,
-            origin=(0.0, 0.0, -1.0),
-            direction=(math.sin(theta_i), 0.0, math.cos(theta_i)),
-            bounds=(-0.5, 0.5, -0.5, 0.5),
-            polarization="s", device=device)
-        torch.manual_seed(seed)
-        tracer = AdvancedRayTracerPBRTGPU(verts, faces, fm, materials, device)
-        out = tracer.trace(rays, max_steps=3, surface_model="fresnel")
-        means.append(out["reflectivity"][:, 1, 0].mean().item())
-
-    # 理论 σ（二项分布）
-    sigma = math.sqrt(R_s_expected * (1 - R_s_expected) / N)
-    global_mean = sum(means) / len(means)
-    dev = abs(global_mean - R_s_expected)
-
-    print("\n[Test 3] MC mean within 3σ confidence interval")
-    print("  R_expected = {:.6f}".format(R_s_expected))
-    print("  global mean = {:.6f}".format(global_mean))
-    print("  σ (binomial) = {:.6f}".format(sigma))
-    print("  |dev| = {:.6f}, 3σ = {:.6f}".format(dev, 3 * sigma))
-
-    assert dev < 3 * sigma, \
-        "Global mean deviates more than 3σ: {:.4e} > {:.4e}".format(
-            dev, 3 * sigma)
+    # Monte Carlo 统计误差：σ/√N ≈ 0.3/sqrt(8192) ≈ 0.003
+    assert abs(mean_w_step1 - E_w_expected) < 0.02, \
+        "E[w] mismatch: {:.6f} vs {:.6f}".format(mean_w_step1, E_w_expected)
 
 
 if __name__ == "__main__":

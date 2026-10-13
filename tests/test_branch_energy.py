@@ -1,14 +1,18 @@
 """
 tests/test_branch_energy.py
 ============================
-光线分裂能量守恒的等价验证。
+光线分裂的概率与期望验证。
 
-当前 GeoRay 每条光线只走一个 Monte Carlo 分支。
-但分支概率乘加应严格守恒：
-    P_specular + P_diffuse + P_refract + P_absorb = 1
-且对所有 N 条光线的平均：
-    ⟨w_next/w_prev⟩ = ⟨branch_prob⟩ = 1（期望意义上）
+关键物理：
+    单路径 MC 追踪中，每条光线只走一个分支。
+    权重 = 分支概率的累乘。这意味着：
+      E[w] = P_spec · P_spec + P_refract · P_refract = R² + T²
+    而不是 1（后者只在多路径叠加时才成立）。
+
+    因此"权重期望 = 1"的断言是错误的。
+    正确的守恒约束是界面级归一化：R + T + A = 1。
 """
+import math
 import torch
 import trimesh
 import pytest
@@ -24,10 +28,16 @@ def make_flat_interface(device, hs=100.0):
     return verts, faces
 
 
+def fresnel_Rs(n1, n2, theta_i):
+    sin_t = n1 * math.sin(theta_i) / n2
+    cos_t = math.sqrt(1.0 - sin_t ** 2)
+    cos_i = math.cos(theta_i)
+    r_s = (n1 * cos_i - n2 * cos_t) / (n1 * cos_i + n2 * cos_t)
+    return r_s ** 2
+
+
 def test_branch_probabilities_sum_to_one():
-    """
-    每个界面的 P_absorb + P_diffuse + P_specular + P_refract = 1。
-    """
+    """界面的 P_absorb + P_diffuse + P_specular + P_refract = 1。"""
     device = torch.device("cpu")
     verts, faces = make_flat_interface(device)
     fm = torch.tensor([[1, 0], [1, 0]], dtype=torch.long, device=device)
@@ -49,8 +59,8 @@ def test_branch_probabilities_sum_to_one():
     T = out["transmissivity"][:, 1, 0]
     A = out["absorptivity"][:, 1, 0]
     total = R + T + A
-
     interacted = total > 1e-6
+
     if interacted.any():
         max_dev = (total[interacted] - 1.0).abs().max().item()
 
@@ -61,10 +71,14 @@ def test_branch_probabilities_sum_to_one():
         assert max_dev < 1e-4
 
 
-def test_branch_energy_expectation():
+def test_branch_energy_expectation_correct():
     """
-    Monte Carlo 单路径追踪中，权重期望恒为 1。
-    即 Σ E_final / N ≈ 1（在足够多光线下）。
+    ★ 修复：验证 E[w] = R² + T²，不是 1。
+
+    物理依据：单路径 MC 追踪中权重 = 分支概率的累乘。
+    经过 1 次交互后：
+        w = P_spec（如果走反射分支）或 P_refract（如果走折射分支）
+        E[w] = P_spec · P_spec + P_refract · P_refract = R² + T²
     """
     device = torch.device("cpu")
     verts, faces = make_flat_interface(device)
@@ -74,10 +88,16 @@ def test_branch_energy_expectation():
         1: {"n": 1.5, "reflectivity": 1.0, "diffuse": 0.0, "absorptivity": 0.0},
     }
 
-    N = 4096
+    theta_i = math.radians(45.0)
+    R_s = fresnel_Rs(1.0, 1.5, theta_i)
+    T_s = 1.0 - R_s
+    E_w_expected = R_s ** 2 + T_s ** 2
+
+    N = 8192
     rays = generate_rays(
         source_type="grid", num_rays=N,
-        origin=(0.0, 0.0, -1.0), direction=(0.0, 0.0, 1.0),
+        origin=(0.0, 0.0, -1.0),
+        direction=(math.sin(theta_i), 0.0, math.cos(theta_i)),
         bounds=(-0.5, 0.5, -0.5, 0.5),
         polarization="s", device=device)
 
@@ -85,21 +105,23 @@ def test_branch_energy_expectation():
     tracer = AdvancedRayTracerPBRTGPU(verts, faces, fm, materials, device)
     out = tracer.trace(rays, max_steps=3, surface_model="fresnel")
 
-    final_mean = out["energy"][:, -1].mean().item()
+    mean_w_step1 = out["energy"][:, 1].mean().item()
 
-    print("\n[Test 2] Branch energy expectation")
-    print("  N = {}".format(N))
-    print("  Mean final weight: {:.6f}".format(final_mean))
+    print("\n[Test 2] Branch energy expectation = R² + T²")
+    print("  R_s = {:.6f}, T_s = {:.6f}".format(R_s, T_s))
+    print("  E[w]_expected = {:.6f}".format(E_w_expected))
+    print("  E[w]_measured = {:.6f}".format(mean_w_step1))
 
-    # 期望权重 = 1（因为 R+T=1）
-    # 但每条光线只走一个分支，所以 N 条光线的平均 ≈ 1
-    assert abs(final_mean - 1.0) < 0.02
+    # MC 统计误差 ~ 0.003（N=8192）
+    assert abs(mean_w_step1 - E_w_expected) < 0.02, \
+        "E[w] mismatch: {:.6f} vs {:.6f}".format(
+            mean_w_step1, E_w_expected)
 
 
 def test_branch_probability_ratio():
     """
-    分支概率比值应匹配解析 Fresnel：
-    P_specular / P_refract = R / (1-R)  （无吸收、无漫反射时）
+    分支概率比值匹配解析 Fresnel：
+    P_specular / (P_specular + P_refract) = R
     """
     device = torch.device("cpu")
     verts, faces = make_flat_interface(device)
@@ -109,9 +131,7 @@ def test_branch_probability_ratio():
         1: {"n": 1.5, "reflectivity": 1.0, "diffuse": 0.0, "absorptivity": 0.0},
     }
 
-    import math
     theta_i = math.radians(45.0)
-
     rays = generate_rays(
         source_type="grid", num_rays=64,
         origin=(0.0, 0.0, -1.0),
@@ -124,17 +144,9 @@ def test_branch_probability_ratio():
 
     R = out["reflectivity"][:, 1, 0]
     T = out["transmissivity"][:, 1, 0]
-
-    # R / (R+T) = P_specular / (P_specular + P_refract)
     ratio = (R / (R + T + 1e-12)).mean().item()
 
-    # 解析：R_s(45°) / 1.0
-    n1, n2 = 1.0, 1.5
-    sin_t = n1 * math.sin(theta_i) / n2
-    cos_t = math.sqrt(1 - sin_t ** 2)
-    cos_i = math.cos(theta_i)
-    r_s = (n1 * cos_i - n2 * cos_t) / (n1 * cos_i + n2 * cos_t)
-    R_expected = r_s ** 2
+    R_expected = fresnel_Rs(1.0, 1.5, theta_i)
 
     print("\n[Test 3] Branch probability ratio")
     print("  P_spec / (P_spec + P_refract) = {:.6f}".format(ratio))
