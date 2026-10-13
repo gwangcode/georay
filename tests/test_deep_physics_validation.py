@@ -358,7 +358,10 @@ def test_brewster_angle_polarization_purity():
     """
     Brewster 角 θ_B = atan(n₂/n₁) 处 R_p = 0，反射光完全 s 偏振。
 
-    ★ 修复：按光线方向过滤反射光线，不用 transmissivity 字段。
+    ★ 修复：只用 norm > 1e-6 过滤有实际位移的光线。
+       escape 光线在 step 2 有 +dir*1.0 位移（norm≈1），
+       被吸收/已逃逸的光线位置不变（norm=0）。
+       之前用 active[:,2] 过滤是错的——step 2 所有光线都 inactive。
     """
     device = torch.device("cpu")
     n1, n2 = 1.0, 1.5
@@ -384,29 +387,35 @@ def test_brewster_angle_polarization_purity():
     tracer = AdvancedRayTracerPBRTGPU(verts, faces, fm, materials, device)
     out = tracer.trace(rays, max_steps=3, surface_model="fresnel")
 
-    # ★ 按方向过滤反射光线
-    pos = out["positions"]
-    active = out["active"]
-    d_after = pos[:, 2] - pos[:, 1]
-    norm = d_after.norm(dim=-1, keepdim=True)
-    valid = (norm.squeeze(-1) > 1e-6) & active[:, 2]
-    d_unit = torch.zeros_like(d_after)
-    d_unit[valid] = d_after[valid] / norm[valid]
+    # ★ 按位移过滤：有实际位移的光线（逃逸），norm ≈ 1
+    pos = out["positions"]              # [N, S+1, 3]
+    d_after = pos[:, 2] - pos[:, 1]     # step 2 - step 1
+    norm = d_after.norm(dim=-1)
+    valid = norm > 1e-6
 
+    d_unit = torch.zeros_like(d_after)
+    d_unit[valid] = d_after[valid] / norm[valid].unsqueeze(-1)
+
+    # 反射 = 方向 z 分量为负（往回走）
     reflected_mask = valid & (d_unit[:, 2] < 0)
+    refracted_mask = valid & (d_unit[:, 2] > 0)
     n_reflected = reflected_mask.sum().item()
+    n_refracted = refracted_mask.sum().item()
 
     print("  Total rays     : {}".format(rays["origins"].shape[0]))
     print("  Reflected rays : {}".format(n_reflected))
+    print("  Refracted rays : {}".format(n_refracted))
 
     assert n_reflected > 20, \
-        "Too few reflected rays: {}".format(n_reflected)
+        "Too few reflected rays: {} (expected ~7% of 2000 = 140)".format(n_reflected)
 
     S1_reflected = out["stokes"][reflected_mask, 1, 1]
     S1_min = S1_reflected.min().item()
     S1_mean = S1_reflected.mean().item()
 
     print("  S1 of reflected: min={:.6f}, mean={:.6f}".format(S1_min, S1_mean))
+
+    # 反射光必须是 s 偏振（Brewster 角 R_p = 0 的物理后果）
     assert S1_min > 0.99, \
         "Reflected light must be s-polarized (S1=1), got min S1={}".format(S1_min)
 
