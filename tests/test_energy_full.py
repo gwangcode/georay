@@ -51,9 +51,8 @@ def test_weight_unity_pure_reflection():
     """
     纯反射场景（custom + reflectivity=1）：每条光线权重恒为 1。
 
-    ★ 修复：原测试用 Fresnel 场景，Monte Carlo 单路径分支导致
-       总能量统计不守恒（R=0.04 时 96% 折射，权重降到 0.96）。
-       改为纯反射场景，权重不下降。
+    ★ 修复：N 必须用完全平方数（grid 光源会取整），
+       或者直接从 ray_dict 读实际光线数。
     """
     device = torch.device("cpu")
     verts, faces = make_flat_interface(device)
@@ -63,12 +62,16 @@ def test_weight_unity_pure_reflection():
         1: {"n": 1.5, "reflectivity": 1.0, "diffuse": 0.0, "absorptivity": 0.0},
     }
 
-    N = 1000
+    # ★ 用完全平方数避免 grid 光源被截断
+    N_request = 1024   # 32²
     rays = generate_rays(
-        source_type="grid", num_rays=N,
+        source_type="grid", num_rays=N_request,
         origin=(0.0, 0.0, -1.0), direction=(0.0, 0.0, 1.0),
         bounds=(-0.5, 0.5, -0.5, 0.5),
         polarization="s", device=device)
+
+    # ★ 用实际光线数作为初始总能量
+    N = rays["origins"].shape[0]
 
     tracer = AdvancedRayTracerPBRTGPU(verts, faces, fm, materials, device)
     out = tracer.trace(rays, max_steps=5, surface_model="custom")
@@ -79,14 +82,14 @@ def test_weight_unity_pure_reflection():
     rel_err = abs(total_final - total_initial) / total_initial
 
     print("\n[Test 1] Weight unity (pure reflection)")
-    print("  N = {}".format(N))
+    print("  Requested N: {}".format(N_request))
+    print("  Actual N   : {}".format(N))
     print("  Initial total: {:.2f}".format(total_initial))
     print("  Final total  : {:.2f}".format(total_final))
     print("  Relative err : {:.4e}".format(rel_err))
 
     assert rel_err < 1e-5, \
         "Pure reflection should preserve total weight: rel_err = {:.4e}".format(rel_err)
-
 
 # ==============================================================================
 # Test 2: 分支权重是 R 或 1-R
