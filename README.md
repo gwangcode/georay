@@ -466,7 +466,7 @@ materials = {
     ...
 }
 ```
-`<spec>` (for `n`, `reflectivity`, `diffuse`, `absorptivity`)
+**`<spec>` (for `n`, `reflectivity`, `diffuse`, `absorptivity`)**
 
 | Form | Example | Kind |
 | :--- | :--- | :--- |
@@ -474,7 +474,7 @@ materials = {
 | 1D wavelength LUT | `{"wavelengths_nm": [...], "values": [...]}` | `kind=1` |
 | 2D wavelength × cos LUT | `{"wavelengths_nm": [...], "cos_theta": [...], "values": [[...]]}` | `kind=2` |
 
-`<grin_spec>`
+**`<grin_spec>`**
 
 | Type | Example |
 | :--- | :--- |
