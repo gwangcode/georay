@@ -716,18 +716,38 @@ def trace_kernel(
     step = wp.int32(0)
 
     while active == 1 and step < max_steps:
+        # ============================================================
+        # 1. 求交 + 推开自相交（不消耗 step）
+        #    ★ 关键修复：把 skip_guard 提到循环开头，
+        #       这样 GRIN 判断基于"真正的下一个命中"。
+        # ============================================================
         q = wp.mesh_query_ray(mesh_id, origin, d, far)
+        skip_guard = wp.int32(0)
+        while skip_guard < 8:
+            if not q.result:
+                break
+            if q.t > eps and q.face != prev_face:
+                break
+            origin = origin + d * (q.t + eps)
+            q = wp.mesh_query_ray(mesh_id, origin, d, far)
+            skip_guard = skip_guard + 1
 
+        # ============================================================
+        # 2. 判断当前介质 GRIN 状态
+        # ============================================================
         gkind = wp.int32(0)
-        if medium_id >= 0 and medium_id < num_media:
-            gkind = grin_kind[medium_id]
-
+        if medium_id >= 0:
+            if medium_id < num_media:
+                gkind = grin_kind[medium_id]
         g_active = (gkind > 0)
 
+        # ============================================================
+        # 3. 决策：GRIN 步进 vs 表面交互
+        # ============================================================
         if g_active and ((not q.result) or q.t > ds):
-            # ============================================================
+            # ========================================================
             # GRIN RK4 步进
-            # ============================================================
+            # ========================================================
             n_curr, grad_curr = eval_grin_n_and_grad(
                 medium_id, origin, wl, grin_kind, grin_n0, grin_A,
                 prop_data_offset, prop_data_size,
@@ -824,19 +844,9 @@ def trace_kernel(
             hist_dop[tid, step] = wp.sqrt(S1 * S1 + S2 * S2 + S3 * S3) / (1.0 + 1e-12)
 
         else:
-            # ============================================================
-            # 表面交互
-            # ============================================================
-            skip_guard = wp.int32(0)
-            while skip_guard < 8:
-                if not q.result:
-                    break
-                if q.t > eps and q.face != prev_face:
-                    break
-                origin = origin + d * (q.t + eps)
-                q = wp.mesh_query_ray(mesh_id, origin, d, far)
-                skip_guard = skip_guard + 1
-
+            # ========================================================
+            # 表面交互（q 已经是有效命中，不需要再做 skip_guard）
+            # ========================================================
             cur_refl = wp.float32(0.0)
             cur_trans = wp.float32(0.0)
             cur_abs = wp.float32(0.0)
@@ -844,6 +854,7 @@ def trace_kernel(
             cur_n2 = wp.float32(1.0)
 
             if not q.result:
+                # 逃逸
                 origin = origin + d * 1.0
                 active = wp.int32(0)
             else:
@@ -876,8 +887,9 @@ def trace_kernel(
 
                 # ---- n1 ----
                 gkind_1 = wp.int32(0)
-                if n1_id >= 0 and n1_id < num_media:
-                    gkind_1 = grin_kind[n1_id]
+                if n1_id >= 0:
+                    if n1_id < num_media:
+                        gkind_1 = grin_kind[n1_id]
                 if gkind_1 > 0:
                     n1, _ = eval_grin_n_and_grad(
                         n1_id, origin, wl, grin_kind, grin_n0, grin_A,
@@ -901,8 +913,9 @@ def trace_kernel(
 
                 # ---- n2 ----
                 gkind_2 = wp.int32(0)
-                if n2_id >= 0 and n2_id < num_media:
-                    gkind_2 = grin_kind[n2_id]
+                if n2_id >= 0:
+                    if n2_id < num_media:
+                        gkind_2 = grin_kind[n2_id]
                 if gkind_2 > 0:
                     n2, _ = eval_grin_n_and_grad(
                         n2_id, origin, wl, grin_kind, grin_n0, grin_A,
@@ -1104,7 +1117,6 @@ def trace_kernel(
         hist_n1[tid, step] = 1.0
         hist_n2[tid, step] = 1.0
         hist_dop[tid, step] = wp.sqrt(S1 * S1 + S2 * S2 + S3 * S3) / (1.0 + 1e-12)
-
 
 # ==============================================================================
 # LUT Builder
