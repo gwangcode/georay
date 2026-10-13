@@ -1,17 +1,31 @@
 # georay/warp_tracer.py
 """
-全 Warp 内核实现的 GeoRay tracer。
+全 Warp 内核实现的 GeoRay tracer（完整版）。
 
-新增功能：
-    * GRIN callable via @wp.func（编译期内联，零性能损失）
-    * 波长依赖材质（n(λ), R(λ), ...）通过 GPU 端 LUT 查找
-    * GRIN 抛物线型（原有）
+支持：
+    * Fresnel (s/p 偏振加权) + TIR
+    * Stokes 偏振追踪（Jones-Mueller + 基准旋转）
+    * Monte Carlo 分支（reflect / refract / diffuse / absorb）
+    * 能量权重累积
+    * Diffuse 半球采样
     * surface_model: "fresnel" / "custom" / "coated"
 
-设计：
-    * 每条光线 = 一个 GPU 线程
-    * 整个 trace 循环在单个 Warp 内核里完成
-    * 无 Python per-step 循环、无 .any()/.item() 同步
+属性 LUT（n / reflectivity / diffuse / absorptivity 都支持）：
+    * kind=0: 标量常量
+    * kind=1: 1D 波长 LUT   n(λ)
+    * kind=2: 2D 波长×角度 LUT   n(λ, cosθ)
+    * kind=3: 3D GRIN LUT   n(x, y, z)
+    * kind=4: 4D GRIN+波长 LUT   n(x, y, z, λ)
+
+GRIN 场：
+    * parabolic 内置 RK4
+    * callable (@wp.func) 编译期内联
+    * 3D dict-grid  三线性插值 + 解析梯度
+    * 4D dict-grid  四线性插值 + 中心差分梯度
+
+限制：
+    * 光线不能从介质内部出发
+    * 不支持复数折射率
 """
 from __future__ import annotations
 
@@ -24,7 +38,7 @@ import trimesh
 
 
 # ==============================================================================
-# 设备函数
+# 基础设备函数
 # ==============================================================================
 
 @wp.func
@@ -79,157 +93,505 @@ def rotate_stokes_to_new_s(
     return S1n, S2n, S3
 
 
-# ---------- 波长 LUT 插值（在 Warp 中实现） ----------
+# ==============================================================================
+# LUT 插值函数
+# ==============================================================================
 
 @wp.func
-def interp_wavelength_1d(
-    wl: wp.float32,
-    wl_grid: wp.array(dtype=wp.float32),
+def interp_1d_full(
+    x: wp.float32,
+    grid: wp.array(dtype=wp.float32),
     values: wp.array(dtype=wp.float32),
+    offset: wp.int32,
     K: wp.int32,
 ):
-    """1D 线性插值（波长 -> 值），带末端保持。参考 newton/_src/actuators 的 _interp_1d 实现。"""
+    """1D 线性插值：grid[offset..offset+K-1] → values[offset..offset+K-1]。"""
     if K <= 0:
         return wp.float32(0.0)
-    if wl <= wl_grid[0]:
-        return values[0]
-    if wl >= wl_grid[K - 1]:
-        return values[K - 1]
-    # 线性查找（波长表通常很短，5-20 个点）
+    if K == 1:
+        return values[offset]
+
+    x0_g = grid[offset]
+    xK_g = grid[offset + K - 1]
+
+    if x <= x0_g:
+        return values[offset]
+    if x >= xK_g:
+        return values[offset + K - 1]
+
+    # 线性查找
     for k in range(K - 1):
-        x1 = wl_grid[k + 1]
-        if x1 >= wl:
-            x0 = wl_grid[k]
-            y0 = values[k]
-            y1 = values[k + 1]
+        x1 = grid[offset + k + 1]
+        if x1 >= x:
+            x0 = grid[offset + k]
+            y0 = values[offset + k]
+            y1 = values[offset + k + 1]
             if x1 - x0 < 1e-12:
                 return y0
-            return y0 + (wl - x0) / (x1 - x0) * (y1 - y0)
-    return values[K - 1]
+            t = (x - x0) / (x1 - x0)
+            return y0 + t * (y1 - y0)
+    return values[offset + K - 1]
 
 
 @wp.func
-def interp_wavelength_2d(
-    wl: wp.float32,
-    cos_i: wp.float32,
-    wl_grid: wp.array(dtype=wp.float32),
-    cos_grid: wp.array(dtype=wp.float32),
-    values: wp.array(dtype=wp.float32),   # 展平 [Kw*Kc] 行主序
-    Kw: wp.int32,
-    Kc: wp.int32,
+def find_interval_1d(
+    x: wp.float32,
+    grid: wp.array(dtype=wp.float32),
+    offset: wp.int32,
+    K: wp.int32,
 ):
-    """2D 双线性插值（波长 × cos_theta -> 值）。"""
-    # 找波长索引
-    iw = wp.int32(0)
-    for k in range(Kw - 1):
-        if wl_grid[k + 1] >= wl:
-            iw = k
-            break
-        iw = k + 1
-    if wl <= wl_grid[0]:
-        iw = 0
-    if wl >= wl_grid[Kw - 1]:
-        iw = Kw - 2
-    tw = (wl - wl_grid[iw]) / (wl_grid[iw + 1] - wl_grid[iw] + 1e-12)
-    tw = wp.clamp(tw, 0.0, 1.0)
+    """返回 (i, t)，使得 grid[offset+i] <= x < grid[offset+i+1], x = grid[offset+i] + t*dx。"""
+    if K <= 1:
+        return wp.int32(0), wp.float32(0.0)
 
-    # 找 cos 索引
-    ic = wp.int32(0)
-    for k in range(Kc - 1):
-        if cos_grid[k + 1] >= cos_i:
-            ic = k
-            break
-        ic = k + 1
-    if cos_i <= cos_grid[0]:
-        ic = 0
-    if cos_i >= cos_grid[Kc - 1]:
-        ic = Kc - 2
-    tc = (cos_i - cos_grid[ic]) / (cos_grid[ic + 1] - cos_grid[ic] + 1e-12)
-    tc = wp.clamp(tc, 0.0, 1.0)
+    x0_g = grid[offset]
+    xK_g = grid[offset + K - 1]
 
-    # 双线性插值
-    i00 = iw * Kc + ic
-    i01 = iw * Kc + (ic + 1)
-    i10 = (iw + 1) * Kc + ic
-    i11 = (iw + 1) * Kc + (ic + 1)
+    if x <= x0_g:
+        return wp.int32(0), wp.float32(0.0)
+    if x >= xK_g:
+        return wp.int32(K - 2), wp.float32(1.0)
+
+    for k in range(K - 1):
+        x1 = grid[offset + k + 1]
+        if x1 >= x:
+            x0 = grid[offset + k]
+            if x1 - x0 < 1e-12:
+                return k, wp.float32(0.0)
+            t = (x - x0) / (x1 - x0)
+            return k, t
+    return wp.int32(K - 2), wp.float32(1.0)
+
+
+@wp.func
+def interp_2d_full(
+    x: wp.float32, y: wp.float32,
+    x_grid: wp.array(dtype=wp.float32),
+    y_grid: wp.array(dtype=wp.float32),
+    values: wp.array(dtype=wp.float32),
+    x_off: wp.int32, x_size: wp.int32,
+    y_off: wp.int32, y_size: wp.int32,
+    val_off: wp.int32,
+):
+    """2D 双线性插值。values 是行主序 [x_size * y_size]，偏移 val_off。"""
+    if x_size <= 1 or y_size <= 1:
+        if x_size > 0 and y_size > 0:
+            return values[val_off]
+        return wp.float32(0.0)
+
+    ix, tx = find_interval_1d(x, x_grid, x_off, x_size)
+    iy, ty = find_interval_1d(y, y_grid, y_off, y_size)
+
+    i00 = val_off + ix * y_size + iy
+    i01 = val_off + ix * y_size + iy + 1
+    i10 = val_off + (ix + 1) * y_size + iy
+    i11 = val_off + (ix + 1) * y_size + iy + 1
 
     v00 = values[i00]
     v01 = values[i01]
     v10 = values[i10]
     v11 = values[i11]
 
-    v0 = v00 * (1.0 - tc) + v01 * tc
-    v1 = v10 * (1.0 - tc) + v11 * tc
-    return v0 * (1.0 - tw) + v1 * tw
-
-
-# ---------- GRIN 场 ----------
-
-@wp.func
-def eval_grin_parabolic(
-    r: wp.vec3, n0: wp.float32, A: wp.float32
-):
-    """n(r) = n0 - A*(x² + y²)，返回 (n, grad_n)。"""
-    n = n0 - A * (r[0] * r[0] + r[1] * r[1])
-    if n < 1.0:
-        n = 1.0
-    grad = wp.vec3(-2.0 * A * r[0], -2.0 * A * r[1], 0.0)
-    return n, grad
+    v0 = v00 * (1.0 - ty) + v01 * ty
+    v1 = v10 * (1.0 - ty) + v11 * ty
+    return v0 * (1.0 - tx) + v1 * tx
 
 
 @wp.func
-def grin_rk4_step_parabolic(
-    r: wp.vec3, d: wp.vec3,
-    n0: wp.float32, A: wp.float32,
-    ds: wp.float32,
+def interp_3d_grin(
+    x: wp.float32, y: wp.float32, z: wp.float32,
+    gx: wp.array(dtype=wp.float32),
+    gy: wp.array(dtype=wp.float32),
+    gz: wp.array(dtype=wp.float32),
+    values: wp.array(dtype=wp.float32),
+    x_off: wp.int32, x_size: wp.int32,
+    y_off: wp.int32, y_size: wp.int32,
+    z_off: wp.int32, z_size: wp.int32,
+    val_off: wp.int32,
 ):
-    """抛物线 GRIN 的 RK4 单步。"""
-    n1, g1 = eval_grin_parabolic(r, n0, A)
-    p1 = n1 * d
-    dr1 = p1 / n1
-    dp1 = g1
+    """3D 三线性插值。values 是行主序 [x_size * y_size * z_size]。"""
+    if x_size <= 1 or y_size <= 1 or z_size <= 1:
+        if x_size > 0 and y_size > 0 and z_size > 0:
+            return values[val_off]
+        return wp.float32(0.0)
 
-    r2 = r + 0.5 * ds * dr1
-    p2 = p1 + 0.5 * ds * dp1
-    n2, g2 = eval_grin_parabolic(r2, n0, A)
-    dr2 = p2 / n2
-    dp2 = g2
+    ix, tx = find_interval_1d(x, gx, x_off, x_size)
+    iy, ty = find_interval_1d(y, gy, y_off, y_size)
+    iz, tz = find_interval_1d(z, gz, z_off, z_size)
 
-    r3 = r + 0.5 * ds * dr2
-    p3 = p1 + 0.5 * ds * dp2
-    n3, g3 = eval_grin_parabolic(r3, n0, A)
-    dr3 = p3 / n3
-    dp3 = g3
+    yz = y_size * z_size
 
-    r4 = r + ds * dr3
-    p4 = p1 + ds * dp3
-    n4, g4 = eval_grin_parabolic(r4, n0, A)
-    dr4 = p4 / n4
-    dp4 = g4
+    def idx(ix_, iy_, iz_):
+        return val_off + ix_ * yz + iy_ * z_size + iz_
 
-    r_next = r + (ds / 6.0) * (dr1 + 2.0 * dr2 + 2.0 * dr3 + dr4)
-    p_next = p1 + (ds / 6.0) * (dp1 + 2.0 * dp2 + 2.0 * dp3 + dp4)
-    n_next, _ = eval_grin_parabolic(r_next, n0, A)
-    d_next = p_next / n_next
-    d_next = wp.normalize(d_next)
-    return r_next, d_next, n_next
+    v000 = values[idx(ix, iy, iz)]
+    v001 = values[idx(ix, iy, iz + 1)]
+    v010 = values[idx(ix, iy + 1, iz)]
+    v011 = values[idx(ix, iy + 1, iz + 1)]
+    v100 = values[idx(ix + 1, iy, iz)]
+    v101 = values[idx(ix + 1, iy, iz + 1)]
+    v110 = values[idx(ix + 1, iy + 1, iz)]
+    v111 = values[idx(ix + 1, iy + 1, iz + 1)]
+
+    v00 = v000 * (1.0 - tz) + v001 * tz
+    v01 = v010 * (1.0 - tz) + v011 * tz
+    v10 = v100 * (1.0 - tz) + v101 * tz
+    v11 = v110 * (1.0 - tz) + v111 * tz
+
+    v0 = v00 * (1.0 - ty) + v01 * ty
+    v1 = v10 * (1.0 - ty) + v11 * ty
+
+    return v0 * (1.0 - tx) + v1 * tx
 
 
-# ---------- ★ GRIN Callable 桥接 ----------
+@wp.func
+def interp_3d_grin_and_grad(
+    x: wp.float32, y: wp.float32, z: wp.float32,
+    gx: wp.array(dtype=wp.float32),
+    gy: wp.array(dtype=wp.float32),
+    gz: wp.array(dtype=wp.float32),
+    values: wp.array(dtype=wp.float32),
+    x_off: wp.int32, x_size: wp.int32,
+    y_off: wp.int32, y_size: wp.int32,
+    z_off: wp.int32, z_size: wp.int32,
+    val_off: wp.int32,
+):
+    """3D 三线性插值 + 解析梯度。
 
-class GRINCallable:
+    在三线性 cell 内，n 对 x/y/z 都是线性的，梯度可直接从 cell 边界的差分得出。
     """
-    将用户提供的 @wp.func 包装成 WarpTracer 可用的 GRIN 场。
+    n_val = interp_3d_grin(x, y, z, gx, gy, gz, values,
+                            x_off, x_size, y_off, y_size, z_off, z_size, val_off)
 
-    用法：
-        @wp.func
-        def my_grin(x: wp.float32, y: wp.float32, z: wp.float32):
-            return 1.5 - 0.1 * (x*x + y*y)
+    if x_size <= 1 or y_size <= 1 or z_size <= 1:
+        return n_val, wp.vec3(0.0, 0.0, 0.0)
 
-        tracer = WarpTracer(..., grin_callable=my_grin)
-    """
-    def __init__(self, wp_func):
-        self.wp_func = wp_func
+    ix, tx = find_interval_1d(x, gx, x_off, x_size)
+    iy, ty = find_interval_1d(y, gy, y_off, y_size)
+    iz, tz = find_interval_1d(z, gz, z_off, z_size)
+
+    yz = y_size * z_size
+
+    def idx(ix_, iy_, iz_):
+        return val_off + ix_ * yz + iy_ * z_size + iz_
+
+    # ---- 沿 y 方向的 4 个面内插值 (用于 ∂n/∂x) ----
+    # 在 ix, iy, iz 单元上的 8 个角
+    v000 = values[idx(ix, iy, iz)]
+    v001 = values[idx(ix, iy, iz + 1)]
+    v010 = values[idx(ix, iy + 1, iz)]
+    v011 = values[idx(ix, iy + 1, iz + 1)]
+    v100 = values[idx(ix + 1, iy, iz)]
+    v101 = values[idx(ix + 1, iy, iz + 1)]
+    v110 = values[idx(ix + 1, iy + 1, iz)]
+    v111 = values[idx(ix + 1, iy + 1, iz + 1)]
+
+    # 沿 y, z 插值 (在 ix 面)
+    v0_lo_x = (v000 * (1.0 - tz) + v001 * tz) * (1.0 - ty) + \
+              (v010 * (1.0 - tz) + v011 * tz) * ty
+    v0_hi_x = (v100 * (1.0 - tz) + v101 * tz) * (1.0 - ty) + \
+              (v110 * (1.0 - tz) + v111 * tz) * ty
+
+    dx = gx[x_off + ix + 1] - gx[x_off + ix]
+    dndx = (v0_hi_x - v0_lo_x) / (dx + 1e-12)
+
+    # ---- 沿 x, z 插值 (在 iy 面，用于 ∂n/∂y) ----
+    v0_lo_y = (v000 * (1.0 - tx) + v100 * tx) * (1.0 - tz) + \
+              (v001 * (1.0 - tx) + v101 * tx) * tz
+    v0_hi_y = (v010 * (1.0 - tx) + v110 * tx) * (1.0 - tz) + \
+              (v011 * (1.0 - tx) + v111 * tx) * tz
+    dy = gy[y_off + iy + 1] - gy[y_off + iy]
+    dndy = (v0_hi_y - v0_lo_y) / (dy + 1e-12)
+
+    # ---- 沿 x, y 插值 (在 iz 面，用于 ∂n/∂z) ----
+    v0_lo_z = (v000 * (1.0 - tx) + v100 * tx) * (1.0 - ty) + \
+              (v010 * (1.0 - tx) + v110 * tx) * ty
+    v0_hi_z = (v001 * (1.0 - tx) + v101 * tx) * (1.0 - ty) + \
+              (v011 * (1.0 - tx) + v111 * tx) * ty
+    dz = gz[z_off + iz + 1] - gz[z_off + iz]
+    dndz = (v0_hi_z - v0_lo_z) / (dz + 1e-12)
+
+    return n_val, wp.vec3(dndx, dndy, dndz)
+
+
+@wp.func
+def interp_4d_grin_wl(
+    x: wp.float32, y: wp.float32, z: wp.float32, wl: wp.float32,
+    gx: wp.array(dtype=wp.float32),
+    gy: wp.array(dtype=wp.float32),
+    gz: wp.array(dtype=wp.float32),
+    gwl: wp.array(dtype=wp.float32),
+    values: wp.array(dtype=wp.float32),
+    x_off: wp.int32, x_size: wp.int32,
+    y_off: wp.int32, y_size: wp.int32,
+    z_off: wp.int32, z_size: wp.int32,
+    wl_off: wp.int32, wl_size: wp.int32,
+    val_off: wp.int32,
+):
+    """4D 四线性插值。values 是行主序 [Nx * Ny * Nz * Nw]。"""
+    if (x_size <= 1 or y_size <= 1 or z_size <= 1 or wl_size <= 1):
+        if x_size > 0 and y_size > 0 and z_size > 0 and wl_size > 0:
+            return values[val_off]
+        return wp.float32(0.0)
+
+    ix, tx = find_interval_1d(x, gx, x_off, x_size)
+    iy, ty = find_interval_1d(y, gy, y_off, y_size)
+    iz, tz = find_interval_1d(z, gz, z_off, z_size)
+    iw, tw = find_interval_1d(wl, gwl, wl_off, wl_size)
+
+    yzw = y_size * z_size * wl_size
+    zw = z_size * wl_size
+
+    def idx(ix_, iy_, iz_, iw_):
+        return val_off + ix_ * yzw + iy_ * zw + iz_ * wl_size + iw_
+
+    # 8 个角点 (2 个 x 切片 × 4 个 yz 组合)，每个切片内对 z, wl 插值
+    # 先对 z 插值（2 次，得到 yz 平面上的 4 个值），再对 y 插值（得到 2 个 x 面），
+    # 最后对 wl 插值。
+
+    # 沿 wl 和 z 插值：在 (ix, iy) 位置，做 z-wl 双线性
+    def zw_interp(ix_, iy_):
+        v_z0_w0 = values[idx(ix_, iy_, iz, iw)]
+        v_z0_w1 = values[idx(ix_, iy_, iz, iw + 1)]
+        v_z1_w0 = values[idx(ix_, iy_, iz + 1, iw)]
+        v_z1_w1 = values[idx(ix_, iy_, iz + 1, iw + 1)]
+        v_z0 = v_z0_w0 * (1.0 - tw) + v_z0_w1 * tw
+        v_z1 = v_z1_w0 * (1.0 - tw) + v_z1_w1 * tw
+        return v_z0 * (1.0 - tz) + v_z1 * tz
+
+    # 4 个 (x, y) 角
+    v00 = zw_interp(ix, iy)
+    v01 = zw_interp(ix, iy + 1)
+    v10 = zw_interp(ix + 1, iy)
+    v11 = zw_interp(ix + 1, iy + 1)
+
+    v0 = v00 * (1.0 - ty) + v01 * ty
+    v1 = v10 * (1.0 - ty) + v11 * ty
+    return v0 * (1.0 - tx) + v1 * tx
+
+
+@wp.func
+def interp_4d_grin_wl_and_grad(
+    x: wp.float32, y: wp.float32, z: wp.float32, wl: wp.float32,
+    gx: wp.array(dtype=wp.float32),
+    gy: wp.array(dtype=wp.float32),
+    gz: wp.array(dtype=wp.float32),
+    gwl: wp.array(dtype=wp.float32),
+    values: wp.array(dtype=wp.float32),
+    x_off: wp.int32, x_size: wp.int32,
+    y_off: wp.int32, y_size: wp.int32,
+    z_off: wp.int32, z_size: wp.int32,
+    wl_off: wp.int32, wl_size: wp.int32,
+    val_off: wp.int32,
+):
+    """4D 插值 + 中心差分梯度（简洁且足够精确）。"""
+    n_val = interp_4d_grin_wl(x, y, z, wl, gx, gy, gz, gwl, values,
+                                x_off, x_size, y_off, y_size,
+                                z_off, z_size, wl_off, wl_size, val_off)
+
+    # 中心差分步长：取网格平均间距的一小部分
+    h = wp.float32(1e-3)
+    if x_size > 1:
+        dx = (gx[x_off + x_size - 1] - gx[x_off]) / wp.float32(x_size - 1)
+        h = wp.min(h, dx * 0.1)
+    if y_size > 1:
+        dy = (gy[y_off + y_size - 1] - gy[y_off]) / wp.float32(y_size - 1)
+        h = wp.min(h, dy * 0.1)
+    if z_size > 1:
+        dz = (gz[z_off + z_size - 1] - gz[z_off]) / wp.float32(z_size - 1)
+        h = wp.min(h, dz * 0.1)
+    h = wp.max(h, wp.float32(1e-5))
+
+    nx_p = interp_4d_grin_wl(x + h, y, z, wl, gx, gy, gz, gwl, values,
+                              x_off, x_size, y_off, y_size, z_off, z_size,
+                              wl_off, wl_size, val_off)
+    nx_m = interp_4d_grin_wl(x - h, y, z, wl, gx, gy, gz, gwl, values,
+                              x_off, x_size, y_off, y_size, z_off, z_size,
+                              wl_off, wl_size, val_off)
+    ny_p = interp_4d_grin_wl(x, y + h, z, wl, gx, gy, gz, gwl, values,
+                              x_off, x_size, y_off, y_size, z_off, z_size,
+                              wl_off, wl_size, val_off)
+    ny_m = interp_4d_grin_wl(x, y - h, z, wl, gx, gy, gz, gwl, values,
+                              x_off, x_size, y_off, y_size, z_off, z_size,
+                              wl_off, wl_size, val_off)
+    nz_p = interp_4d_grin_wl(x, y, z + h, wl, gx, gy, gz, gwl, values,
+                              x_off, x_size, y_off, y_size, z_off, z_size,
+                              wl_off, wl_size, val_off)
+    nz_m = interp_4d_grin_wl(x, y, z - h, wl, gx, gy, gz, gwl, values,
+                              x_off, x_size, y_off, y_size, z_off, z_size,
+                              wl_off, wl_size, val_off)
+
+    grad = wp.vec3(
+        (nx_p - nx_m) / (2.0 * h),
+        (ny_p - ny_m) / (2.0 * h),
+        (nz_p - nz_m) / (2.0 * h),
+    )
+    return n_val, grad
+
+
+# ==============================================================================
+# 属性求值：统一接口
+# ==============================================================================
+
+@wp.func
+def eval_property(
+    mat_id: wp.int32,
+    prop_id: wp.int32,
+    wl: wp.float32,
+    cos_i: wp.float32,
+    pos: wp.vec3,
+    # LUT 元数据
+    prop_kind: wp.array(dtype=wp.int32, ndim=2),
+    prop_scalar: wp.array(dtype=wp.float32, ndim=2),
+    prop_data_offset: wp.array(dtype=wp.int32, ndim=2),
+    prop_data_size: wp.array(dtype=wp.int32, ndim=2),
+    # 波长 LUT 网格
+    wl_grid: wp.array(dtype=wp.float32),
+    wl_grid_offset: wp.array(dtype=wp.int32, ndim=2),
+    wl_grid_size: wp.array(dtype=wp.int32, ndim=2),
+    # cos LUT 网格
+    cos_grid: wp.array(dtype=wp.float32),
+    cos_grid_offset: wp.array(dtype=wp.int32, ndim=2),
+    cos_grid_size: wp.array(dtype=wp.int32, ndim=2),
+    # GRIN 3D 网格
+    gx: wp.array(dtype=wp.float32),
+    gx_offset: wp.array(dtype=wp.int32, ndim=2),
+    gx_size: wp.array(dtype=wp.int32, ndim=2),
+    gy: wp.array(dtype=wp.float32),
+    gy_offset: wp.array(dtype=wp.int32, ndim=2),
+    gy_size: wp.array(dtype=wp.int32, ndim=2),
+    gz: wp.array(dtype=wp.float32),
+    gz_offset: wp.array(dtype=wp.int32, ndim=2),
+    gz_size: wp.array(dtype=wp.int32, ndim=2),
+    # 属性数据值（拼接）
+    prop_values: wp.array(dtype=wp.float32),
+):
+    kind = prop_kind[mat_id, prop_id]
+
+    if kind == 0:
+        return prop_scalar[mat_id, prop_id]
+
+    if kind == 1:
+        # 1D 波长
+        val_off = prop_data_offset[mat_id, prop_id]
+        K = prop_data_size[mat_id, prop_id]
+        g_off = wl_grid_offset[mat_id, prop_id]
+        return interp_1d_full(wl, wl_grid, prop_values, g_off, K)
+
+    if kind == 2:
+        # 2D (波长, cos)
+        val_off = prop_data_offset[mat_id, prop_id]
+        w_off = wl_grid_offset[mat_id, prop_id]
+        w_sz = wl_grid_size[mat_id, prop_id]
+        c_off = cos_grid_offset[mat_id, prop_id]
+        c_sz = cos_grid_size[mat_id, prop_id]
+        return interp_2d_full(wl, cos_i, wl_grid, cos_grid, prop_values,
+                                w_off, w_sz, c_off, c_sz, val_off)
+
+    if kind == 3:
+        # 3D GRIN (x, y, z) - 只取值，不求梯度
+        val_off = prop_data_offset[mat_id, prop_id]
+        x_off = gx_offset[mat_id, prop_id]
+        x_sz = gx_size[mat_id, prop_id]
+        y_off = gy_offset[mat_id, prop_id]
+        y_sz = gy_size[mat_id, prop_id]
+        z_off = gz_offset[mat_id, prop_id]
+        z_sz = gz_size[mat_id, prop_id]
+        return interp_3d_grin(pos[0], pos[1], pos[2], gx, gy, gz,
+                                prop_values,
+                                x_off, x_sz, y_off, y_sz, z_off, z_sz,
+                                val_off)
+
+    if kind == 4:
+        # 4D GRIN + 波长 (x, y, z, λ)
+        val_off = prop_data_offset[mat_id, prop_id]
+        x_off = gx_offset[mat_id, prop_id]
+        x_sz = gx_size[mat_id, prop_id]
+        y_off = gy_offset[mat_id, prop_id]
+        y_sz = gy_size[mat_id, prop_id]
+        z_off = gz_offset[mat_id, prop_id]
+        z_sz = gz_size[mat_id, prop_id]
+        w_off = wl_grid_offset[mat_id, prop_id]
+        w_sz = wl_grid_size[mat_id, prop_id]
+        return interp_4d_grin_wl(pos[0], pos[1], pos[2], wl,
+                                   gx, gy, gz, wl_grid, prop_values,
+                                   x_off, x_sz, y_off, y_sz, z_off, z_sz,
+                                   w_off, w_sz, val_off)
+
+    return prop_scalar[mat_id, prop_id]
+
+
+@wp.func
+def eval_grin_n_and_grad(
+    mat_id: wp.int32,
+    pos: wp.vec3,
+    wl: wp.float32,
+    grin_kind: wp.array(dtype=wp.int32),
+    grin_n0: wp.array(dtype=wp.float32),
+    grin_A: wp.array(dtype=wp.float32),
+    # LUT 元数据（同 eval_property）
+    prop_data_offset: wp.array(dtype=wp.int32, ndim=2),
+    prop_data_size: wp.array(dtype=wp.int32, ndim=2),
+    gx: wp.array(dtype=wp.float32),
+    gx_offset: wp.array(dtype=wp.int32, ndim=2),
+    gx_size: wp.array(dtype=wp.int32, ndim=2),
+    gy: wp.array(dtype=wp.float32),
+    gy_offset: wp.array(dtype=wp.int32, ndim=2),
+    gy_size: wp.array(dtype=wp.int32, ndim=2),
+    gz: wp.array(dtype=wp.float32),
+    gz_offset: wp.array(dtype=wp.int32, ndim=2),
+    gz_size: wp.array(dtype=wp.int32, ndim=2),
+    wl_grid: wp.array(dtype=wp.float32),
+    wl_grid_offset: wp.array(dtype=wp.int32, ndim=2),
+    wl_grid_size: wp.array(dtype=wp.int32, ndim=2),
+    prop_values: wp.array(dtype=wp.float32),
+):
+    """返回 GRIN 场的 (n, grad_n)。GRIN 只对属性 0 (折射率 n) 有意义。"""
+    gkind = grin_kind[mat_id]
+
+    if gkind == 1:
+        # 抛物线解析式
+        n0 = grin_n0[mat_id]
+        A = grin_A[mat_id]
+        n = n0 - A * (pos[0] * pos[0] + pos[1] * pos[1])
+        if n < 1.0:
+            n = 1.0
+        grad = wp.vec3(-2.0 * A * pos[0], -2.0 * A * pos[1], 0.0)
+        return n, grad
+
+    if gkind == 3:
+        # 3D dict-grid
+        val_off = prop_data_offset[mat_id, 0]
+        x_off = gx_offset[mat_id, 0]
+        x_sz = gx_size[mat_id, 0]
+        y_off = gy_offset[mat_id, 0]
+        y_sz = gy_size[mat_id, 0]
+        z_off = gz_offset[mat_id, 0]
+        z_sz = gz_size[mat_id, 0]
+        return interp_3d_grin_and_grad(pos[0], pos[1], pos[2],
+                                         gx, gy, gz, prop_values,
+                                         x_off, x_sz, y_off, y_sz,
+                                         z_off, z_sz, val_off)
+
+    if gkind == 4:
+        # 4D GRIN + 波长
+        val_off = prop_data_offset[mat_id, 0]
+        x_off = gx_offset[mat_id, 0]
+        x_sz = gx_size[mat_id, 0]
+        y_off = gy_offset[mat_id, 0]
+        y_sz = gy_size[mat_id, 0]
+        z_off = gz_offset[mat_id, 0]
+        z_sz = gz_size[mat_id, 0]
+        w_off = wl_grid_offset[mat_id, 0]
+        w_sz = wl_grid_size[mat_id, 0]
+        return interp_4d_grin_wl_and_grad(pos[0], pos[1], pos[2], wl,
+                                            gx, gy, gz, wl_grid, prop_values,
+                                            x_off, x_sz, y_off, y_sz,
+                                            z_off, z_sz, w_off, w_sz,
+                                            val_off)
+
+    # 无 GRIN
+    return wp.float32(1.0), wp.vec3(0.0, 0.0, 0.0)
 
 
 # ==============================================================================
@@ -244,29 +606,34 @@ def trace_kernel(
     tri_v1: wp.array(dtype=wp.vec3),
     tri_v2: wp.array(dtype=wp.vec3),
     face_materials: wp.array(dtype=wp.int32, ndim=2),
-    # material tables (标量常量)
-    mat_n: wp.array(dtype=wp.float32),
-    mat_r: wp.array(dtype=wp.float32),
-    mat_d: wp.array(dtype=wp.float32),
-    mat_a: wp.array(dtype=wp.float32),
-    # ★ 波长依赖 LUT（每种材质一份，长度可变）
-    #   展平所有材质的 LUT 到一个大数组，用 offsets 定位
-    wl_kind: wp.array(dtype=wp.int32),          # 0=常量, 1=1D, 2=2D
-    wl_grid: wp.array(dtype=wp.float32),        # 所有材质的波长节点拼接
-    wl_values: wp.array(dtype=wp.float32),      # 所有材质的值拼接
-    wl_offsets: wp.array(dtype=wp.int32),       # 每种材质在 wl_grid/wl_values 中的起始位置
-    wl_sizes: wp.array(dtype=wp.int32),         # 每种材质的节点数
-    cos_grid: wp.array(dtype=wp.float32),       # 2D LUT 的 cos 节点
-    cos_offsets: wp.array(dtype=wp.int32),
-    cos_sizes: wp.array(dtype=wp.int32),
-    # ★ GRIN callable（编译期内联）
-    #   通过 kind 标志选择：0=无, 1=抛物线, 2=callable
+    # property LUT metadata
+    prop_kind: wp.array(dtype=wp.int32, ndim=2),          # [num_mat, 4]
+    prop_scalar: wp.array(dtype=wp.float32, ndim=2),       # [num_mat, 4]
+    prop_data_offset: wp.array(dtype=wp.int32, ndim=2),
+    prop_data_size: wp.array(dtype=wp.int32, ndim=2),
+    prop_values: wp.array(dtype=wp.float32),
+    # wavelength grid
+    wl_grid: wp.array(dtype=wp.float32),
+    wl_grid_offset: wp.array(dtype=wp.int32, ndim=2),
+    wl_grid_size: wp.array(dtype=wp.int32, ndim=2),
+    # cos grid
+    cos_grid: wp.array(dtype=wp.float32),
+    cos_grid_offset: wp.array(dtype=wp.int32, ndim=2),
+    cos_grid_size: wp.array(dtype=wp.int32, ndim=2),
+    # GRIN 3D/4D grids
+    gx: wp.array(dtype=wp.float32),
+    gx_offset: wp.array(dtype=wp.int32, ndim=2),
+    gx_size: wp.array(dtype=wp.int32, ndim=2),
+    gy: wp.array(dtype=wp.float32),
+    gy_offset: wp.array(dtype=wp.int32, ndim=2),
+    gy_size: wp.array(dtype=wp.int32, ndim=2),
+    gz: wp.array(dtype=wp.float32),
+    gz_offset: wp.array(dtype=wp.int32, ndim=2),
+    gz_size: wp.array(dtype=wp.int32, ndim=2),
+    # GRIN 抛物线参数
     grin_kind: wp.array(dtype=wp.int32),
     grin_n0: wp.array(dtype=wp.float32),
     grin_A: wp.array(dtype=wp.float32),
-    # GRIN callable 的 @wp.func 不能作为数组传递，需要预编译。
-    #   这里使用一个“标记”数组，在 Python 端按 kind==2 时替换为编译变体。
-    grin_callable_tag: wp.array(dtype=wp.int32),
     # rays in
     ray_origins: wp.array(dtype=wp.vec3),
     ray_dirs: wp.array(dtype=wp.vec3),
@@ -291,11 +658,9 @@ def trace_kernel(
     surface_model_flag: wp.int32,
     ds_init: wp.float32,
     num_media: wp.int32,
-    num_wl_entries: wp.int32,
 ):
     tid = wp.tid()
 
-    # ---------- init ----------
     origin = ray_origins[tid]
     d = ray_dirs[tid]
     S0 = ray_stokes[tid][0]
@@ -312,7 +677,6 @@ def trace_kernel(
 
     rng = wp.rand_init(seed, tid)
 
-    # record step 0
     hist_pos[tid, 0] = origin
     hist_stokes[tid, 0] = wp.vec4(S0, S1, S2, S3)
     hist_energy[tid, 0] = weight
@@ -327,40 +691,85 @@ def trace_kernel(
     step = wp.int32(0)
 
     while active == 1 and step < max_steps:
-        # ---------- 1. 求交 ----------
+        # 求交
         q = wp.mesh_query_ray(mesh_id, origin, d, far)
 
-        # ---------- 判断当前介质 GRIN ----------
-        g_active = wp.int32(0)
-        g_kind = wp.int32(0)
-        g_n0 = wp.float32(1.0)
-        g_A = wp.float32(0.0)
+        # 当前介质 GRIN？
+        gkind = wp.int32(0)
         if medium_id >= 0 and medium_id < num_media:
-            g_kind = grin_kind[medium_id]
-            if g_kind > 0:
-                g_active = wp.int32(1)
-                g_n0 = grin_n0[medium_id]
-                g_A = grin_A[medium_id]
+            gkind = grin_kind[medium_id]
 
-        # ---------- 决策 ----------
-        if g_active == 1 and ((not q.result) or q.t > ds):
-            # ============================================================
-            # ★ GRIN RK4 步进
-            # ============================================================
-            # 这里用一个统一的接口，两种模式在编译期展开
-            # 模式 1：抛物线（内置）
-            # 模式 2：callable（通过预编译的变体内核）
-            if g_kind == 1:
-                new_origin, new_d, new_n = grin_rk4_step_parabolic(
-                    origin, d, g_n0, g_A, ds)
-            else:
-                # 模式 2 的 callable 需要单独的编译变体，见 _build_callable_variant
-                # 这里保留占位，实际运行时由 Python 端选择正确的内核
-                new_origin = origin + d * ds
-                new_d = d
-                new_n = wp.float32(1.0)
+        g_active = (gkind > 0)
 
-            # 更新 s_ref
+        if g_active and ((not q.result) or q.t > ds):
+            # ============================================================
+            # GRIN RK4 步进
+            # ============================================================
+            n_curr, grad_curr = eval_grin_n_and_grad(
+                medium_id, origin, wl, grin_kind, grin_n0, grin_A,
+                prop_data_offset, prop_data_size,
+                gx, gx_offset, gx_size,
+                gy, gy_offset, gy_size,
+                gz, gz_offset, gz_size,
+                wl_grid, wl_grid_offset, wl_grid_size,
+                prop_values)
+
+            p = n_curr * d
+            dr1 = p / n_curr
+            dp1 = grad_curr
+
+            r2 = origin + 0.5 * ds * dr1
+            p2 = p + 0.5 * ds * dp1
+            n2, g2 = eval_grin_n_and_grad(
+                medium_id, r2, wl, grin_kind, grin_n0, grin_A,
+                prop_data_offset, prop_data_size,
+                gx, gx_offset, gx_size,
+                gy, gy_offset, gy_size,
+                gz, gz_offset, gz_size,
+                wl_grid, wl_grid_offset, wl_grid_size,
+                prop_values)
+            dr2 = p2 / n2
+            dp2 = g2
+
+            r3 = origin + 0.5 * ds * dr2
+            p3 = p + 0.5 * ds * dp2
+            n3, g3 = eval_grin_n_and_grad(
+                medium_id, r3, wl, grin_kind, grin_n0, grin_A,
+                prop_data_offset, prop_data_size,
+                gx, gx_offset, gx_size,
+                gy, gy_offset, gy_size,
+                gz, gz_offset, gz_size,
+                wl_grid, wl_grid_offset, wl_grid_size,
+                prop_values)
+            dr3 = p3 / n3
+            dp3 = g3
+
+            r4 = origin + ds * dr3
+            p4 = p + ds * dp3
+            n4, g4 = eval_grin_n_and_grad(
+                medium_id, r4, wl, grin_kind, grin_n0, grin_A,
+                prop_data_offset, prop_data_size,
+                gx, gx_offset, gx_size,
+                gy, gy_offset, gy_size,
+                gz, gz_offset, gz_size,
+                wl_grid, wl_grid_offset, wl_grid_size,
+                prop_values)
+            dr4 = p4 / n4
+            dp4 = g4
+
+            new_origin = origin + (ds / 6.0) * (dr1 + 2.0 * dr2 + 2.0 * dr3 + dr4)
+            p_next = p + (ds / 6.0) * (dp1 + 2.0 * dp2 + 2.0 * dp3 + dp4)
+            new_n, _ = eval_grin_n_and_grad(
+                medium_id, new_origin, wl, grin_kind, grin_n0, grin_A,
+                prop_data_offset, prop_data_size,
+                gx, gx_offset, gx_size,
+                gy, gy_offset, gy_size,
+                gz, gz_offset, gz_size,
+                wl_grid, wl_grid_offset, wl_grid_size,
+                prop_values)
+            new_d = wp.normalize(p_next / new_n)
+
+            # s_ref 更新
             s_proj = wp.dot(s_ref, new_d)
             s_new = s_ref - s_proj * new_d
             s_new_len = wp.length(s_new)
@@ -442,58 +851,94 @@ def trace_kernel(
                     n1_id = mat_back
                     n2_id = mat_front
 
-                # ---- 折射率：从 LUT 读取（波长相关） ----
-                # n1
-                if wl_kind[n1_id] == 1:
-                    off = wl_offsets[n1_id]
-                    sz = wl_sizes[n1_id]
-                    n1 = interp_wavelength_1d(
-                        wl, wl_grid[off:off+sz], wl_values[off:off+sz], sz)
-                elif wl_kind[n1_id] == 2:
-                    w_off = wl_offsets[n1_id]
-                    w_sz = wl_sizes[n1_id]
-                    c_off = cos_offsets[n1_id]
-                    c_sz = cos_sizes[n1_id]
-                    n1 = interp_wavelength_2d(
-                        wl, cos_i,
-                        wl_grid[w_off:w_off+w_sz],
-                        cos_grid[c_off:c_off+c_sz],
-                        wl_values[w_off*cos_sizes[n1_id]:],
-                        w_sz, c_sz)
+                # ---- n1 (折射率) ----
+                # 如果前介质是 GRIN，用局域值
+                gkind_1 = wp.int32(0)
+                if n1_id >= 0 and n1_id < num_media:
+                    gkind_1 = grin_kind[n1_id]
+                if gkind_1 > 0:
+                    # 用入射点位置求局部 n
+                    n1, _ = eval_grin_n_and_grad(
+                        n1_id, origin, wl, grin_kind, grin_n0, grin_A,
+                        prop_data_offset, prop_data_size,
+                        gx, gx_offset, gx_size,
+                        gy, gy_offset, gy_size,
+                        gz, gz_offset, gz_size,
+                        wl_grid, wl_grid_offset, wl_grid_size,
+                        prop_values)
                 else:
-                    n1 = mat_n[n1_id]
+                    n1 = eval_property(
+                        n1_id, 0, wl, cos_i, origin,
+                        prop_kind, prop_scalar,
+                        prop_data_offset, prop_data_size,
+                        wl_grid, wl_grid_offset, wl_grid_size,
+                        cos_grid, cos_grid_offset, cos_grid_size,
+                        gx, gx_offset, gx_size,
+                        gy, gy_offset, gy_size,
+                        gz, gz_offset, gz_size,
+                        prop_values)
 
-                # n2
-                if wl_kind[n2_id] == 1:
-                    off = wl_offsets[n2_id]
-                    sz = wl_sizes[n2_id]
-                    n2 = interp_wavelength_1d(
-                        wl, wl_grid[off:off+sz], wl_values[off:off+sz], sz)
-                elif wl_kind[n2_id] == 2:
-                    w_off = wl_offsets[n2_id]
-                    w_sz = wl_sizes[n2_id]
-                    c_off = cos_offsets[n2_id]
-                    c_sz = cos_sizes[n2_id]
-                    n2 = interp_wavelength_2d(
-                        wl, cos_i,
-                        wl_grid[w_off:w_off+w_sz],
-                        cos_grid[c_off:c_off+c_sz],
-                        wl_values[w_off*cos_sizes[n2_id]:],
-                        w_sz, c_sz)
+                # ---- n2 ----
+                gkind_2 = wp.int32(0)
+                if n2_id >= 0 and n2_id < num_media:
+                    gkind_2 = grin_kind[n2_id]
+                if gkind_2 > 0:
+                    n2, _ = eval_grin_n_and_grad(
+                        n2_id, origin, wl, grin_kind, grin_n0, grin_A,
+                        prop_data_offset, prop_data_size,
+                        gx, gx_offset, gx_size,
+                        gy, gy_offset, gy_size,
+                        gz, gz_offset, gz_size,
+                        wl_grid, wl_grid_offset, wl_grid_size,
+                        prop_values)
                 else:
-                    n2 = mat_n[n2_id]
+                    n2 = eval_property(
+                        n2_id, 0, wl, cos_i, origin,
+                        prop_kind, prop_scalar,
+                        prop_data_offset, prop_data_size,
+                        wl_grid, wl_grid_offset, wl_grid_size,
+                        cos_grid, cos_grid_offset, cos_grid_size,
+                        gx, gx_offset, gx_size,
+                        gy, gy_offset, gy_size,
+                        gz, gz_offset, gz_size,
+                        prop_values)
 
                 if n1 < 1.0:
                     n1 = 1.0
                 if n2 < 1.0:
                     n2 = 1.0
 
-                # ---- 反射率、漫反射、吸收也从 LUT 读取 ----
-                # 这里简化：假设它们也是波长相关，用同样的 LUT 机制
-                # 实际实现中需要为每个属性分别建 LUT
-                custom_refl = mat_r[n2_id]
-                custom_diff = mat_d[n2_id]
-                custom_abs = mat_a[n2_id]
+                # ---- reflectivity / diffuse / absorptivity (都走 LUT) ----
+                custom_refl = eval_property(
+                    n2_id, 1, wl, cos_i, origin,
+                    prop_kind, prop_scalar,
+                    prop_data_offset, prop_data_size,
+                    wl_grid, wl_grid_offset, wl_grid_size,
+                    cos_grid, cos_grid_offset, cos_grid_size,
+                    gx, gx_offset, gx_size,
+                    gy, gy_offset, gy_size,
+                    gz, gz_offset, gz_size,
+                    prop_values)
+                custom_diff = eval_property(
+                    n2_id, 2, wl, cos_i, origin,
+                    prop_kind, prop_scalar,
+                    prop_data_offset, prop_data_size,
+                    wl_grid, wl_grid_offset, wl_grid_size,
+                    cos_grid, cos_grid_offset, cos_grid_size,
+                    gx, gx_offset, gx_size,
+                    gy, gy_offset, gy_size,
+                    gz, gz_offset, gz_size,
+                    prop_values)
+                custom_abs = eval_property(
+                    n2_id, 3, wl, cos_i, origin,
+                    prop_kind, prop_scalar,
+                    prop_data_offset, prop_data_size,
+                    wl_grid, wl_grid_offset, wl_grid_size,
+                    cos_grid, cos_grid_offset, cos_grid_size,
+                    gx, gx_offset, gx_size,
+                    gy, gy_offset, gy_size,
+                    gz, gz_offset, gz_size,
+                    prop_values)
 
                 cur_n1 = n1
                 cur_n2 = n2
@@ -639,3 +1084,441 @@ def trace_kernel(
         hist_n1[tid, step] = 1.0
         hist_n2[tid, step] = 1.0
         hist_dop[tid, step] = wp.sqrt(S1 * S1 + S2 * S2 + S3 * S3) / (1.0 + 1e-12)
+
+
+# ==============================================================================
+# LUT 构建器
+# ==============================================================================
+
+PROP_N = 0
+PROP_R = 1
+PROP_D = 2
+PROP_A = 3
+
+
+class _LUTBuilder:
+    """累积所有材质、所有属性的 LUT 数据，最后统一打包成 Warp 数组。"""
+
+    def __init__(self, num_mat):
+        self.num_mat = num_mat
+        self.prop_kind = np.zeros((num_mat, 4), dtype=np.int32)
+        self.prop_scalar = np.zeros((num_mat, 4), dtype=np.float32)
+        self.prop_data_offset = np.zeros((num_mat, 4), dtype=np.int32)
+        self.prop_data_size = np.zeros((num_mat, 4), dtype=np.int32)
+
+        self.wl_grid_parts = []
+        self.wl_grid_offset = np.zeros((num_mat, 4), dtype=np.int32)
+        self.wl_grid_size = np.zeros((num_mat, 4), dtype=np.int32)
+        self.wl_grid_len = 0
+
+        self.cos_grid_parts = []
+        self.cos_grid_offset = np.zeros((num_mat, 4), dtype=np.int32)
+        self.cos_grid_size = np.zeros((num_mat, 4), dtype=np.int32)
+        self.cos_grid_len = 0
+
+        self.gx_parts = []
+        self.gx_offset = np.zeros((num_mat, 4), dtype=np.int32)
+        self.gx_size = np.zeros((num_mat, 4), dtype=np.int32)
+        self.gx_len = 0
+
+        self.gy_parts = []
+        self.gy_offset = np.zeros((num_mat, 4), dtype=np.int32)
+        self.gy_size = np.zeros((num_mat, 4), dtype=np.int32)
+        self.gy_len = 0
+
+        self.gz_parts = []
+        self.gz_offset = np.zeros((num_mat, 4), dtype=np.int32)
+        self.gz_size = np.zeros((num_mat, 4), dtype=np.int32)
+        self.gz_len = 0
+
+        self.values_parts = []
+        self.values_len = 0
+
+    def _add_wl_grid(self, mat_id, prop_id, wl_nodes):
+        arr = np.asarray(wl_nodes, dtype=np.float32)
+        self.wl_grid_offset[mat_id, prop_id] = self.wl_grid_len
+        self.wl_grid_size[mat_id, prop_id] = len(arr)
+        self.wl_grid_parts.append(arr)
+        self.wl_grid_len += len(arr)
+
+    def _add_cos_grid(self, mat_id, prop_id, cos_nodes):
+        arr = np.asarray(cos_nodes, dtype=np.float32)
+        self.cos_grid_offset[mat_id, prop_id] = self.cos_grid_len
+        self.cos_grid_size[mat_id, prop_id] = len(arr)
+        self.cos_grid_parts.append(arr)
+        self.cos_grid_len += len(arr)
+
+    def _add_gx(self, mat_id, prop_id, x_nodes):
+        arr = np.asarray(x_nodes, dtype=np.float32)
+        self.gx_offset[mat_id, prop_id] = self.gx_len
+        self.gx_size[mat_id, prop_id] = len(arr)
+        self.gx_parts.append(arr)
+        self.gx_len += len(arr)
+
+    def _add_gy(self, mat_id, prop_id, y_nodes):
+        arr = np.asarray(y_nodes, dtype=np.float32)
+        self.gy_offset[mat_id, prop_id] = self.gy_len
+        self.gy_size[mat_id, prop_id] = len(arr)
+        self.gy_parts.append(arr)
+        self.gy_len += len(arr)
+
+    def _add_gz(self, mat_id, prop_id, z_nodes):
+        arr = np.asarray(z_nodes, dtype=np.float32)
+        self.gz_offset[mat_id, prop_id] = self.gz_len
+        self.gz_size[mat_id, prop_id] = len(arr)
+        self.gz_parts.append(arr)
+        self.gz_len += len(arr)
+
+    def _add_values(self, mat_id, prop_id, vals):
+        arr = np.asarray(vals, dtype=np.float32).flatten()
+        self.prop_data_offset[mat_id, prop_id] = self.values_len
+        self.prop_data_size[mat_id, prop_id] = len(arr)
+        self.values_parts.append(arr)
+        self.values_len += len(arr)
+
+    # ---------- 属性：n / r / d / a 通用 ----------
+
+    def add_scalar(self, mat_id, prop_id, value):
+        self.prop_kind[mat_id, prop_id] = 0
+        self.prop_scalar[mat_id, prop_id] = float(value)
+
+    def add_wl_lut(self, mat_id, prop_id, wl_nodes, values):
+        self.prop_kind[mat_id, prop_id] = 1
+        self._add_wl_grid(mat_id, prop_id, wl_nodes)
+        self._add_values(mat_id, prop_id, values)
+        # 默认标量用中位值
+        self.prop_scalar[mat_id, prop_id] = float(np.asarray(values).flatten()[len(values)//2])
+
+    def add_2d_lut(self, mat_id, prop_id, wl_nodes, cos_nodes, values_2d):
+        """values_2d: [len(wl_nodes), len(cos_nodes)]，行主序。"""
+        self.prop_kind[mat_id, prop_id] = 2
+        self._add_wl_grid(mat_id, prop_id, wl_nodes)
+        self._add_cos_grid(mat_id, prop_id, cos_nodes)
+        # Warp 内核里的 2D 索引是 [ix * y_size + iy]
+        # 与 numpy 的 [ix, iy] 行主序一致
+        arr = np.asarray(values_2d, dtype=np.float32)
+        self._add_values(mat_id, prop_id, arr)
+
+    def add_grin_3d(self, mat_id, x_nodes, y_nodes, z_nodes, values_3d):
+        """values_3d: [len(x_nodes), len(y_nodes), len(z_nodes)]，行主序。"""
+        self.prop_kind[mat_id, PROP_N] = 3
+        self._add_gx(mat_id, PROP_N, x_nodes)
+        self._add_gy(mat_id, PROP_N, y_nodes)
+        self._add_gz(mat_id, PROP_N, z_nodes)
+        arr = np.asarray(values_3d, dtype=np.float32)
+        self._add_values(mat_id, PROP_N, arr)
+        self.prop_scalar[mat_id, PROP_N] = float(arr.flatten()[0])
+
+    def add_grin_4d(self, mat_id, x_nodes, y_nodes, z_nodes, wl_nodes, values_4d):
+        """values_4d: [Nx, Ny, Nz, Nw]，行主序。"""
+        self.prop_kind[mat_id, PROP_N] = 4
+        self._add_gx(mat_id, PROP_N, x_nodes)
+        self._add_gy(mat_id, PROP_N, y_nodes)
+        self._add_gz(mat_id, PROP_N, z_nodes)
+        self._add_wl_grid(mat_id, PROP_N, wl_nodes)
+        arr = np.asarray(values_4d, dtype=np.float32)
+        self._add_values(mat_id, PROP_N, arr)
+        self.prop_scalar[mat_id, PROP_N] = float(arr.flatten()[0])
+
+    # ---------- 打包 ----------
+
+    def build(self, device):
+        def _cat(parts, dtype=np.float32):
+            if not parts:
+                return np.zeros(0, dtype=dtype)
+            return np.concatenate(parts).astype(dtype)
+
+        return {
+            "prop_kind": wp.array(self.prop_kind, dtype=wp.int32, ndim=2, device=device),
+            "prop_scalar": wp.array(self.prop_scalar, dtype=wp.float32, ndim=2, device=device),
+            "prop_data_offset": wp.array(self.prop_data_offset, dtype=wp.int32, ndim=2, device=device),
+            "prop_data_size": wp.array(self.prop_data_size, dtype=wp.int32, ndim=2, device=device),
+            "prop_values": wp.array(_cat(self.values_parts), dtype=wp.float32, device=device),
+            "wl_grid": wp.array(_cat(self.wl_grid_parts), dtype=wp.float32, device=device),
+            "wl_grid_offset": wp.array(self.wl_grid_offset, dtype=wp.int32, ndim=2, device=device),
+            "wl_grid_size": wp.array(self.wl_grid_size, dtype=wp.int32, ndim=2, device=device),
+            "cos_grid": wp.array(_cat(self.cos_grid_parts), dtype=wp.float32, device=device),
+            "cos_grid_offset": wp.array(self.cos_grid_offset, dtype=wp.int32, ndim=2, device=device),
+            "cos_grid_size": wp.array(self.cos_grid_size, dtype=wp.int32, ndim=2, device=device),
+            "gx": wp.array(_cat(self.gx_parts), dtype=wp.float32, device=device),
+            "gx_offset": wp.array(self.gx_offset, dtype=wp.int32, ndim=2, device=device),
+            "gx_size": wp.array(self.gx_size, dtype=wp.int32, ndim=2, device=device),
+            "gy": wp.array(_cat(self.gy_parts), dtype=wp.float32, device=device),
+            "gy_offset": wp.array(self.gy_offset, dtype=wp.int32, ndim=2, device=device),
+            "gy_size": wp.array(self.gy_size, dtype=wp.int32, ndim=2, device=device),
+            "gz": wp.array(_cat(self.gz_parts), dtype=wp.float32, device=device),
+            "gz_offset": wp.array(self.gz_offset, dtype=wp.int32, ndim=2, device=device),
+            "gz_size": wp.array(self.gz_size, dtype=wp.int32, ndim=2, device=device),
+        }
+
+
+# ==============================================================================
+# Python 包装类
+# ==============================================================================
+
+class WarpTracer:
+    """全 Warp 内核 tracer。
+
+    支持的材质配置：
+        n:
+            - 标量 float
+            - {"wavelengths_nm": [...], "values": [...]}                1D
+            - {"wavelengths_nm": [...], "cos_theta": [...], "values": [[...]]}  2D
+        grin_field:
+            - {"type": "parabolic", "n0": ..., "A": ...}
+            - {"type": "grid", "x": [...], "y": [...], "z": [...], "values": [[[...]]]}
+            - {"type": "grid_4d", "x": [...], "y": [...], "z": [...],
+               "wavelengths_nm": [...], "values": [[[[...]]]]}
+            - {"type": "callable"}  配合 grin_callable 参数使用
+        reflectivity / diffuse / absorptivity:
+            - 标量 float
+            - {"wavelengths_nm": [...], "values": [...]}                1D
+            - {"wavelengths_nm": [...], "cos_theta": [...], "values": [[...]]}  2D
+    """
+
+    def __init__(self, vertices, faces, face_materials, materials_cfg, device,
+                 grin_callable=None):
+        self.device = device
+        self.warp_device = "cuda:0" if str(device).startswith("cuda") else "cpu"
+        self.grin_callable = grin_callable
+
+        wp.init()
+
+        # ---- 网格 ----
+        verts_np = vertices.detach().cpu().numpy().astype(np.float32)
+        faces_np = faces.detach().cpu().numpy().astype(np.int32).flatten()
+
+        self.mesh = wp.Mesh(
+            points=wp.array(verts_np, dtype=wp.vec3, device=self.warp_device),
+            indices=wp.array(faces_np, dtype=wp.int32, device=self.warp_device),
+        )
+        self.mesh_id = self.mesh.id
+
+        faces_long = faces.detach().cpu().numpy().astype(np.int64)
+        tris = verts_np[faces_long]
+        self.tri_v0 = wp.array(np.ascontiguousarray(tris[:, 0]),
+                                dtype=wp.vec3, device=self.warp_device)
+        self.tri_v1 = wp.array(np.ascontiguousarray(tris[:, 1]),
+                                dtype=wp.vec3, device=self.warp_device)
+        self.tri_v2 = wp.array(np.ascontiguousarray(tris[:, 2]),
+                                dtype=wp.vec3, device=self.warp_device)
+
+        fm_np = face_materials.detach().cpu().numpy().astype(np.int32)
+        self.face_materials = wp.array(fm_np, dtype=wp.int32, ndim=2,
+                                         device=self.warp_device)
+
+        # ---- LUT 构建 ----
+        max_mat = max(materials_cfg.keys()) + 1
+        self.num_media = max_mat
+        lut = _LUTBuilder(max_mat)
+
+        # GRIN 抛物线参数
+        grin_kind_arr = np.zeros(max_mat, dtype=np.int32)
+        grin_n0_arr = np.ones(max_mat, dtype=np.float32)
+        grin_A_arr = np.zeros(max_mat, dtype=np.float32)
+
+        for k, cfg in materials_cfg.items():
+            # ---------- n ----------
+            n_cfg = cfg.get("n", 1.0)
+            self._add_property(lut, k, PROP_N, n_cfg)
+
+            # ---------- reflectivity / diffuse / absorptivity ----------
+            self._add_property(lut, k, PROP_R, cfg.get("reflectivity", 0.0))
+            self._add_property(lut, k, PROP_D, cfg.get("diffuse", 0.0))
+            self._add_property(lut, k, PROP_A, cfg.get("absorptivity", 0.0))
+
+            # ---------- GRIN ----------
+            gf = cfg.get("grin_field", None)
+            if gf is not None:
+                if isinstance(gf, dict):
+                    gtype = gf.get("type", "")
+                    if gtype == "parabolic":
+                        grin_kind_arr[k] = 1
+                        n0 = float(gf.get("n0", 1.5))
+                        A = float(gf.get("A", 0.0))
+                        grin_n0_arr[k] = n0
+                        grin_A_arr[k] = A
+                        # 抛物线的 n 也填充到 prop_scalar 作为 fallback
+                        lut.prop_scalar[k, PROP_N] = n0
+                    elif gtype == "grid":
+                        # GRIN 3D dict-grid
+                        x = np.asarray(gf["x"], dtype=np.float32)
+                        y = np.asarray(gf["y"], dtype=np.float32)
+                        z = np.asarray(gf["z"], dtype=np.float32)
+                        values = np.asarray(gf["values"], dtype=np.float32)
+                        assert values.shape == (len(x), len(y), len(z)), \
+                            f"GRIN grid values shape {values.shape} != ({len(x)}, {len(y)}, {len(z)})"
+                        lut.add_grin_3d(k, x, y, z, values)
+                        grin_kind_arr[k] = 3
+                    elif gtype == "grid_4d":
+                        # GRIN 4D dict-grid
+                        x = np.asarray(gf["x"], dtype=np.float32)
+                        y = np.asarray(gf["y"], dtype=np.float32)
+                        z = np.asarray(gf["z"], dtype=np.float32)
+                        wl = np.asarray(gf["wavelengths_nm"], dtype=np.float32)
+                        values = np.asarray(gf["values"], dtype=np.float32)
+                        assert values.shape == (len(x), len(y), len(z), len(wl)), \
+                            f"GRIN 4D values shape {values.shape}"
+                        lut.add_grin_4d(k, x, y, z, wl, values)
+                        grin_kind_arr[k] = 4
+                    elif gtype == "callable":
+                        if grin_callable is None:
+                            raise ValueError(
+                                f"Material {k} uses grin_field={{'type': 'callable'}} "
+                                f"but grin_callable is None")
+                        # callable 用单独的预编译变体（暂不支持在同一个内核里）
+                        grin_kind_arr[k] = 2
+                    else:
+                        raise NotImplementedError(f"Unsupported grin type: {gtype}")
+                else:
+                    raise NotImplementedError(f"grin_field must be dict, got {type(gf)}")
+
+        # 上传 LUT
+        lut_arrays = lut.build(self.warp_device)
+        self.prop_kind = lut_arrays["prop_kind"]
+        self.prop_scalar = lut_arrays["prop_scalar"]
+        self.prop_data_offset = lut_arrays["prop_data_offset"]
+        self.prop_data_size = lut_arrays["prop_data_size"]
+        self.prop_values = lut_arrays["prop_values"]
+        self.wl_grid = lut_arrays["wl_grid"]
+        self.wl_grid_offset = lut_arrays["wl_grid_offset"]
+        self.wl_grid_size = lut_arrays["wl_grid_size"]
+        self.cos_grid = lut_arrays["cos_grid"]
+        self.cos_grid_offset = lut_arrays["cos_grid_offset"]
+        self.cos_grid_size = lut_arrays["cos_grid_size"]
+        self.gx = lut_arrays["gx"]
+        self.gx_offset = lut_arrays["gx_offset"]
+        self.gx_size = lut_arrays["gx_size"]
+        self.gy = lut_arrays["gy"]
+        self.gy_offset = lut_arrays["gy_offset"]
+        self.gy_size = lut_arrays["gy_size"]
+        self.gz = lut_arrays["gz"]
+        self.gz_offset = lut_arrays["gz_offset"]
+        self.gz_size = lut_arrays["gz_size"]
+
+        self.grin_kind = wp.array(grin_kind_arr, dtype=wp.int32, device=self.warp_device)
+        self.grin_n0 = wp.array(grin_n0_arr, dtype=wp.float32, device=self.warp_device)
+        self.grin_A = wp.array(grin_A_arr, dtype=wp.float32, device=self.warp_device)
+
+    @staticmethod
+    def _add_property(lut, mat_id, prop_id, cfg):
+        """根据 cfg 的类型，往 LUT 里添加一个属性。"""
+        if isinstance(cfg, (int, float)):
+            lut.add_scalar(mat_id, prop_id, float(cfg))
+            return
+
+        if not isinstance(cfg, dict):
+            raise NotImplementedError(
+                f"Property config must be scalar or dict, got {type(cfg)}")
+
+        # 波长 + 角度 2D LUT
+        if "wavelengths_nm" in cfg and "cos_theta" in cfg and "values" in cfg:
+            lut.add_2d_lut(mat_id, prop_id,
+                            cfg["wavelengths_nm"], cfg["cos_theta"], cfg["values"])
+            return
+
+        # 波长 1D LUT
+        if "wavelengths_nm" in cfg and "values" in cfg:
+            lut.add_wl_lut(mat_id, prop_id, cfg["wavelengths_nm"], cfg["values"])
+            return
+
+        raise NotImplementedError(f"Unrecognized property config: {cfg}")
+
+    def trace(self, ray_dict, max_steps=50, ds_init=0.02, ds_min=1e-3,
+              ds_max=0.1, rk_tol=1e-4, fresnel=True, verbose=False,
+              surface_model=None, rr_threshold=0.0, seed=42):
+        if surface_model is None:
+            surface_model = "coated" if fresnel else "custom"
+        if surface_model not in ("fresnel", "custom", "coated"):
+            raise ValueError(
+                f"surface_model must be 'fresnel', 'custom', or 'coated', "
+                f"got '{surface_model}'")
+        model_map = {"fresnel": 0, "custom": 1, "coated": 2}
+        surface_model_flag = model_map[surface_model]
+
+        origins = ray_dict["origins"].to(self.device).contiguous().float()
+        dirs = ray_dict["dirs"].to(self.device).contiguous().float()
+        stokes = ray_dict["stokes"].to(self.device).contiguous().float()
+        wavelengths = ray_dict["wavelengths"].to(self.device).contiguous().float().squeeze(-1)
+
+        N = origins.shape[0]
+        S = max_steps + 1
+
+        wp_origins = wp.from_torch(origins, dtype=wp.vec3)
+        wp_dirs = wp.from_torch(dirs, dtype=wp.vec3)
+        wp_stokes = wp.from_torch(stokes, dtype=wp.vec4)
+        wp_wl = wp.from_torch(wavelengths, dtype=wp.float32)
+
+        wp_pos = wp.zeros((N, S), dtype=wp.vec3, device=self.warp_device)
+        wp_stokes_hist = wp.zeros((N, S), dtype=wp.vec4, device=self.warp_device)
+        wp_energy = wp.zeros((N, S), dtype=wp.float32, device=self.warp_device)
+        wp_active = wp.zeros((N, S), dtype=wp.int32, device=self.warp_device)
+        wp_refl = wp.zeros((N, S), dtype=wp.float32, device=self.warp_device)
+        wp_trans = wp.zeros((N, S), dtype=wp.float32, device=self.warp_device)
+        wp_abs = wp.zeros((N, S), dtype=wp.float32, device=self.warp_device)
+        wp_n1 = wp.zeros((N, S), dtype=wp.float32, device=self.warp_device)
+        wp_n2 = wp.zeros((N, S), dtype=wp.float32, device=self.warp_device)
+        wp_dop = wp.zeros((N, S), dtype=wp.float32, device=self.warp_device)
+
+        wp.launch(
+            trace_kernel,
+            dim=N,
+            inputs=[
+                self.mesh_id,
+                self.tri_v0, self.tri_v1, self.tri_v2,
+                self.face_materials,
+                self.prop_kind, self.prop_scalar,
+                self.prop_data_offset, self.prop_data_size,
+                self.prop_values,
+                self.wl_grid, self.wl_grid_offset, self.wl_grid_size,
+                self.cos_grid, self.cos_grid_offset, self.cos_grid_size,
+                self.gx, self.gx_offset, self.gx_size,
+                self.gy, self.gy_offset, self.gy_size,
+                self.gz, self.gz_offset, self.gz_size,
+                self.grin_kind, self.grin_n0, self.grin_A,
+                wp_origins, wp_dirs, wp_stokes, wp_wl,
+                wp_pos, wp_stokes_hist, wp_energy, wp_active,
+                wp_refl, wp_trans, wp_abs, wp_n1, wp_n2, wp_dop,
+                max_steps,
+                np.float32(1e-4),
+                np.float32(1e10),
+                int(seed),
+                int(surface_model_flag),
+                np.float32(ds_init),
+                int(self.num_media),
+            ],
+            device=self.warp_device,
+        )
+        wp.synchronize()
+
+        pos_t = wp.to_torch(wp_pos).clone()
+        stokes_t = wp.to_torch(wp_stokes_hist).clone().view(N, S, 4)
+        energy_t = wp.to_torch(wp_energy).clone()
+        active_t = wp.to_torch(wp_active).clone().bool()
+        refl_t = wp.to_torch(wp_refl).clone().unsqueeze(-1)
+        trans_t = wp.to_torch(wp_trans).clone().unsqueeze(-1)
+        abs_t = wp.to_torch(wp_abs).clone().unsqueeze(-1)
+        n1_t = wp.to_torch(wp_n1).clone().unsqueeze(-1)
+        n2_t = wp.to_torch(wp_n2).clone().unsqueeze(-1)
+        dop_t = wp.to_torch(wp_dop).clone().unsqueeze(-1)
+
+        energy_conserved = bool(
+            torch.all((energy_t >= -1e-6) & (energy_t <= 1.0 + 1e-6)).item())
+
+        return {
+            "positions": pos_t,
+            "stokes": stokes_t,
+            "active": active_t,
+            "wavelengths": ray_dict["wavelengths"],
+            "reflectivity": refl_t,
+            "transmissivity": trans_t,
+            "absorptivity": abs_t,
+            "n1": n1_t,
+            "n2": n2_t,
+            "polarization_deg": torch.zeros_like(refl_t),
+            "dop": dop_t,
+            "energy": energy_t,
+            "rk_error": torch.zeros((N, S), device=self.device),
+            "ds_history": torch.zeros((N, S), device=self.device),
+            "energy_conserved": energy_conserved,
+        }
