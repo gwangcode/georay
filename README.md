@@ -32,21 +32,21 @@ GeoRay is a research-grade ray tracing library with full Stokes polarization tra
 
 - Scalar refractive index n
 
-- Wavelength-dependent n(λ), reflectivity(λ), diffuse(λ), absorptivity(λ)
+- Wavelength-dependent $n(λ)$, reflectivity($λ$), diffuse($λ$), absorptivity($λ$)
 
-- 2D LUT n(λ, cos θ) for angle- and wavelength-dependent properties
+- 2D LUT $n(λ, cos θ)$ for angle- and wavelength-dependent properties
 
 - Surface models: "fresnel" / "custom" / "coated"
 
 - Gradient-index (GRIN) media:
 
--- Analytic parabolic field n(r) = n₀ - A·(x² + y²)
+-- Analytic parabolic field $n(r) = n₀ - A·(x² + y²)$
 
--- User-supplied @wp.func callable (compile-time inlined, zero overhead)
+-- User-supplied `@wp.func` callable (compile-time inlined, zero overhead)
 
 -- 3D grid-based field with trilinear interpolation and analytic gradient
 
--- 4D grid-based field n(x, y, z, λ) with quadrilinear interpolation
+-- 4D grid-based field $n(x, y, z, λ)$ with quadrilinear interpolation
 
 ### Performance
 - AdvancedRayTracerPBRTGPU — Pure PyTorch BVH, works everywhere (CPU / GPU)
