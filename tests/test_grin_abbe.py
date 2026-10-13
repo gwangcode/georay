@@ -29,19 +29,17 @@ def test_grin_abbe_number_consistent():
     """
     GRIN 介质的 Abbe 数应与输入 n(λ) 一致。
 
-    ★ 修复（关键）：
-      - 让光线从 GRIN 介质内部出发（medium_id=1），
-        这样 step 1 是 GRIN 步进，n1 = n2 = 局部 GRIN 折射率。
-      - 从 step 1 读取 n2，反映 n(λ)。
-      之前从空气出发读 step 1 得到的是材质标量 1.5，与波长无关。
+    ★ 修复：
+      1. 色散系数符号：正常色散要求 n(λ) 随 λ 增大而减小（负号）。
+      2. 系数大小：使用真实玻璃的 Δn/Δλ ≈ -4e-5 / nm。
     """
     device = torch.device("cpu")
     verts, faces, fm = make_grin_box(device)
 
     def grin_fn(x, y, z, wl):
-        # wl 是 [K, 1] 张量，包含每条光线的波长
-        # n0(λ) = 1.5168 + 0.003·(λ - 587.6)  （简化色散）
-        n0 = 1.5168 + 0.003 * (wl - 587.6)
+        # ★ 正常色散：n 随 λ 增大而减小
+        # 系数 -4e-5 / nm 匹配真实 BK7 玻璃
+        n0 = 1.5168 - 4e-5 * (wl - 587.6)
         A = 0.05
         return n0 - A * (x ** 2 + y ** 2)
 
@@ -51,7 +49,6 @@ def test_grin_abbe_number_consistent():
             "absorptivity": 0.0, "grin_field": grin_fn},
     }
 
-    # ★ 采样 3 个标准谱线，从 GRIN 介质内部出发
     n_measured = {}
     for wl in [486.1, 587.6, 656.3]:
         rays = generate_rays(
@@ -59,12 +56,11 @@ def test_grin_abbe_number_consistent():
             origin=(0.0, 0.0, 0.0), direction=(0.0, 0.0, 1.0),
             bounds=(0.0, 0.0, 0.0, 0.0),
             polarization="s", device=device, wavelength_nm=wl,
-            medium_id=1)   # ★ 从 GRIN 介质内部出发
+            medium_id=1)
 
         tracer = AdvancedRayTracerPBRTGPU(verts, faces, fm, materials, device)
         out = tracer.trace(rays, max_steps=10, ds_init=0.01, fresnel=False)
 
-        # ★ 从 step 1 读取 GRIN 场局部 n（此时 n1 = n2 = GRIN 场值）
         n_measured[wl] = out["n2"][0, 1, 0].item()
 
     print("\n[Test 1] GRIN Abbe number")
@@ -72,9 +68,10 @@ def test_grin_abbe_number_consistent():
     print("  n(587.6) = {:.6f}".format(n_measured[587.6]))
     print("  n(656.3) = {:.6f}".format(n_measured[656.3]))
 
-    # 检查色散：正常色散 n(短波长) > n(长波长)
+    # 正常色散：n(短) > n(中) > n(长)
     assert n_measured[486.1] > n_measured[587.6] > n_measured[656.3], \
-        "Normal dispersion should give n(short) > n(long)"
+        "Normal dispersion violated: n(486)={:.6f}, n(588)={:.6f}, n(656)={:.6f}".format(
+            n_measured[486.1], n_measured[587.6], n_measured[656.3])
 
     # Abbe 数
     denom = n_measured[486.1] - n_measured[656.3]
@@ -84,8 +81,9 @@ def test_grin_abbe_number_consistent():
     V_d = (n_measured[587.6] - 1.0) / denom
     print("  Abbe number V_d = {:.2f}".format(V_d))
 
-    assert V_d > 0, "Abbe number should be positive"
-    assert V_d < 1e6, "Abbe number unreasonable: {}".format(V_d)
+    # 真实 BK7 的 V_d ≈ 64，允许 50~80
+    assert 30 < V_d < 100, \
+        "Abbe number out of reasonable range: {:.2f}".format(V_d)
 
 
 def test_grin_chromatic_focal_shift_scales_with_dispersion():
