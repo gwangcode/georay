@@ -34,7 +34,7 @@ GeoRay is a research-grade ray tracing library with full Stokes polarization tra
 
 - Wavelength-dependent $n(λ)$, reflectivity($λ$), diffuse($λ$), absorptivity($λ$)
 
-- 2D LUT $n(λ, cos θ)$ for angle- and wavelength-dependent properties
+- 2D LUT $n(λ, \text{cos} θ)$ for angle- and wavelength-dependent properties
 
 - Surface models: "fresnel" / "custom" / "coated"
 
