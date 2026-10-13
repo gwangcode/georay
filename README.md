@@ -6,278 +6,253 @@
 [![PyTorch](https://img.shields.io/badge/PyTorch-2.0%2B-red)](https://pytorch.org/)
 [![Tests](https://github.com/gwangcode/georay/actions/workflows/test.yml/badge.svg?branch=main)](https://github.com/gwangcode/georay/actions/workflows/test.yml)
 
-**GeoRay** is a pure-PyTorch, GPU-accelerated ray tracer supporting gradient-index (GRIN) media and full Stokes polarization tracking.
+A GPU-Accelerated Ray Tracer for GRIN and Polarization Optics.
 
----
+GeoRay is a research- and engineering-oriented ray tracing library supporting:
 
-## Features
+Fresnel reflection/refraction, TIR, diffuse reflection, and absorption on triangle meshes
 
-- **GPU acceleration** — All operations vectorized in PyTorch (CPU or CUDA).
-- **BVH acceleration** — SoA flattened BVH with 4-triangle leaves; fully vectorized ray-mesh intersection.
-- **GRIN support** — Constant, function-based, or grid-based refractive index fields with adaptive RK4 integration.
-- **Polarization tracking** — Full Stokes vector with Jones-Mueller matrices and reference-frame rotation.
-- **Adaptive step control** — Per-ray RK4 with local error estimation and anti-deadlock protection.
-- **Multiple light sources** — Grid, random, point, area, and mesh surface emitters.
-- **Energy conservation** — Built-in check on reflection + transmission + absorption.
+Full Stokes-vector polarization tracking via the Jones-Mueller formalism
 
----
+Adaptive RK4 stepping inside gradient-index (GRIN) media
+
+Warp GPU kernel implementation: 1000×+ speedup over the pure PyTorch BVH
 
 ## Installation
-
-```bash
-git clone https://github.com/gwangcode/georay.git
-cd GeoRay
-pip install -e .
-```
-## Requirements
-Python >= 3.8
-
-PyTorch >= 2.0
-
-NumPy >= 1.21
-
-Trimesh >= 3.20
-
-GPU is optional but recommended for large scenes.
+Basic install (PyTorch BVH fallback)
+bash
+pip install git+https://github.com/gwangcode/georay
+With Warp GPU acceleration (recommended)
+bash
+pip install "georay[warp] @ git+https://github.com/gwangcode/georay"
+Warp requires a CUDA GPU (Compute Capability ≥ 5.0). Colab T4 is fully supported.
 
 ## Quick Start
-```python
-import torch
-import trimesh
+PyTorch tracer (flexible; supports GRIN and wavelength-dependent materials)
+python
+import torch, trimesh
 from georay import AdvancedRayTracerPBRTGPU, generate_rays
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+device = torch.device("cuda")
 
-# Build a cube
+## Scene
 cube = trimesh.creation.box(extents=[2.0, 2.0, 2.0])
 verts = torch.tensor(cube.vertices, dtype=torch.float32, device=device)
 faces = torch.tensor(cube.faces, dtype=torch.long, device=device)
 face_mats = torch.zeros((faces.shape[0], 2), dtype=torch.long, device=device)
-face_mats[:, 0] = 0   # outside: air
-face_mats[:, 1] = 1   # inside: glass
-
-# Materials
-materials_cfg = {
-    0: {"n": 1.0, "reflectivity": 0.0, "diffuse": 0.0, "absorptivity": 0.0},
-    1: {"n": 1.5, "reflectivity": 0.0, "diffuse": 0.0, "absorptivity": 0.0},
+face_mats[:, 0] = 0
+face_mats[:, 1] = 1
+materials = {
+    0: {"n": 1.0, "reflectivity": 1.0, "diffuse": 0.0, "absorptivity": 0.0},
+    1: {"n": 1.5, "reflectivity": 1.0, "diffuse": 0.0, "absorptivity": 0.0},
 }
 
-# Fire 16 rays from a grid
-rays = generate_rays(
-    source_type="grid", num_rays=16,
-    origin=(0.0, 0.0, -3.0), direction=(0.0, 0.0, 1.0),
-    bounds=(-0.5, 0.5, -0.5, 0.5),
-    polarization="s", wavelength_nm=550.0, device=device,
-)
+## Rays
+rays = generate_rays(source_type="grid", num_rays=1024,
+                     origin=(0.0, 0.0, -3.0), direction=(0.0, 0.0, 1.0),
+                     bounds=(-0.5, 0.5, -0.5, 0.5),
+                     polarization="s", device=device)
 
-# Trace
-tracer = AdvancedRayTracerPBRTGPU(verts, faces, face_mats, materials_cfg, device)
-out = tracer.trace(rays, max_steps=40, fresnel=True)
+## Trace
+tracer = AdvancedRayTracerPBRTGPU(verts, faces, face_mats, materials, device)
+out = tracer.trace(rays, max_steps=20, surface_model="fresnel")
+Warp tracer (fastest; scalar materials + parabolic GRIN only)
+python
+from georay import WarpTracer
 
-print(f"Energy conserved: {out['energy_conserved']}")
-print(f"Output shape: {out['positions'].shape}")
-```
+tracer = WarpTracer(verts, faces, face_mats, materials, device)
+out = tracer.trace(rays, max_steps=20, surface_model="fresnel")
+GRIN parabolic lens (Warp version)
+python
+materials = {
+    0: {"n": 1.0, "reflectivity": 0.0, "diffuse": 0.0, "absorptivity": 0.0},
+    1: {"n": 1.5, "reflectivity": 0.0, "diffuse": 0.0, "absorptivity": 0.0,
+        "grin_field": {"type": "parabolic", "n0": 1.5, "A": 0.1}},
+}
+tracer = WarpTracer(verts, faces, face_mats, materials, device)
+out = tracer.trace(rays, max_steps=200, ds_init=0.02)
+Performance Benchmark
+Environment: Colab T4 GPU, 5,132-face scene, 20-step trace.
 
-## Output Description
-```tracer.trace(rays, ...)``` returns a Python ```dict``` of PyTorch tensors containing the full history of every ray. Let $N$ be the number of rays and $S$ the number of recorded steps (initial state + each propagation step). All tensors are on the same device as the input rays.
+N_rays	PyTorch BVH (ms)	Warp (ms)	Speedup
+1,024	5,029	4.4	1140×
+4,096	8,041	5.5	1454×
+16,384	11,690	6.3	1856×
+65,536	15,184	16.3	930×
+Key insight: WarpTracer compiles the entire trace loop (all max_steps iterations) into a single CUDA kernel, eliminating the Python-level loop and all CPU-GPU synchronization.
 
-|Key	|Shape	|Dtype	|Description|
-|:---   |:---   |:---   |:--- |
-|positions	|[N, S+1, 3]	|float32    |3D position of each ray at every step, in world coordinates (x, y, z).|
-|stokes	|[N, S+1, 4]	|float32	|Full Stokes vector (S0, S1, S2, S3) at every step. S0 is normalized to 1 after each scattering event.|
-|active	|[N, S+1]	|bool	|Whether the ray is still propagating at each step (False after escape or absorption).|
-|wavelengths	|[N, 1]	|float32	|Wavelength of each ray in nanometers (constant along the trace).|
-|reflectivity	|[N, S+1, 1]	|float32	|Reflection coefficient at the last surface interaction of each step (0 if no surface was hit).|
-|transmissivity	|[N, S+1, 1]	|float32	|Transmission coefficient at the last surface interaction of each step.|
-|absorptivity	|[N, S+1, 1]	|float32	|Absorption coefficient at the last surface interaction of each step.|
-|n1	|[N, S+1, 1]	|float32	|Refractive index on the incident side of the last surface hit in this step.|
-|n2	|[N, S+1, 1]	|float32	|Refractive index on the transmitted side of the last surface hit in this step.|
-|polarization_deg	|[N, S+1, 1]	|float32	|Linear polarization angle (degrees), computed as 0.5 * atan2(S2, S1).|
-|dop	|[N, S+1, 1]	|float32	|Degree of polarization sqrt(S1² + S2² + S3²) / S0, in [0, 1].|
-|energy	|[N, S+1]	|float32	|Remaining energy per ray. Starts at 1.0, drops to 0 after absorption.|
-|rk_error	|[N, S+1]	|float32	|Local truncation error estimate from the adaptive RK4 integrator.|
-|ds_history	|[N, S+1]	|float32	|Step size used at each step (adaptively adjusted per ray).|
-|energy_conserved	|bool	|—	|True if every ray satisfies 0 ≤ energy ≤ 1 at every step.|
-### Common access patterns
-```python
-# Final position of every ray
-final_positions = out["positions"][:, -1, :]           # [N, 3]
-
-# Full trajectory of ray i
-trajectory_i = out["positions"][i]                     # [S+1, 3]
-
-# Reflectivity at the first surface hit
-R_first = out["reflectivity"][:, 1, 0]                 # [N]
-
-# Material transitions across all rays
-n1_hist = out["n1"][:, :, 0]                           # [N, S+1]
-n2_hist = out["n2"][:, :, 0]
-
-# Check for internal interfaces (e.g. material A → material B)
-internal = (n1_hist > 1.0) & (n2_hist > 1.0) & (n1_hist != n2_hist)
-```
-### Export Utilities
-GeoRay ships with two exporters that accept the output dict directly.
-
-#### NPZ — full trace history (NumPy binary)
-```python
-from georay import save_trace_output_to_npz
-
-save_trace_output_to_npz(out, "trace.npz")
-```
-saves every tensor from the output dict as a NumPy array in a single compressed .npz file:
-
-```text
-trace.npz
-├── positions           [N, S+1, 3]
-├── stokes              [N, S+1, 4]
-├── active              [N, S+1]
-├── wavelengths         [N, 1]
-├── reflectivity        [N, S+1, 1]
-├── transmissivity      [N, S+1, 1]
-├── absorptivity        [N, S+1, 1]
-├── n1                  [N, S+1, 1]
-├── n2                  [N, S+1, 1]
-├── polarization_deg    [N, S+1, 1]
-├── dop                 [N, S+1, 1]
-├── energy              [N, S+1]
-├── rk_error            [N, S+1]
-└── ds_history          [N, S+1]
-```
-##### Load it back:
-
-```python
-import numpy as np
-data = np.load("trace.npz")
-positions = data["positions"]   # ndarray [N, S+1, 3]
-stokes    = data["stokes"]      # ndarray [N, S+1, 4]
-```
-**Use case:** post-processing, plotting, or statistical analysis in NumPy / SciPy / Pandas.
-
-#### STL — 3D ray tracks (mesh file)
-```python
-from georay import export_ray_history_to_stl
-
-export_ray_history_to_stl(out, "ray_tracks.stl", radius=0.02, sides=6)
-```
-saves every ray segment as a small cylinder in a single STL mesh. Parameters:
-
-|Argument	|Default	|Description|
-|:---       |:---       |:---|
-|filename	|"ray_tracks.stl"	|Output file path.|
-|radius	|0.02	|Radius of each cylinder (in world units).|
-|sides	|6	|Number of polygon sides per cylinder cross-section.|
-
-**Use case:** visual inspection in MeshLab, Blender, ParaView, or any STL viewer.
-
-**Note:** STL is a surface mesh format (no color, no per-ray metadata). For data analysis use NPZ.
-
-## Examples
-Several runnable demos are provided:
-
-```bash
-python examples/demo_cube.py               # Fresnel reflection at cube surfaces
-python examples/demo_grin.py               # Ray bending in a parabolic GRIN medium
-python examples/demo_polarization.py       # s/p polarization evolution at a glass interface
-python examples/demo_stepmesh.py           # Multi-body STEP assembly (requires stepmesh)
-python examples/quick_check_stepfiles.py   # Validation script for stepmesh integration
-```
-Each demo prints the traced ray count, energy conservation status, and output shapes.
-
-## Testing
-```bash
-pip install pytest
-pytest tests/
-```
-**The test suite covers:**
-
-- BVH ray-mesh intersection (hit and miss cases)
-
-- GRIN field parsing (constant and function-based)
-
-- Polarization utilities (perpendicular basis, Jones-Mueller identity, DoP bounds)
+Feature Matrix
+Feature	AdvancedRayTracerPBRTGPU	WarpTracer
+Fresnel (s/p polarization-weighted)	✅	✅
+Total internal reflection (TIR)	✅	✅
+Stokes polarization tracking	✅	✅
+Diffuse reflection	✅	✅
+Absorption	✅	✅
+Monte Carlo energy weight	✅	✅
+surface_model (fresnel/custom/coated)	✅	✅
+Multi-step history	✅	✅
+GRIN constant field	✅	✅
+GRIN parabolic	✅	✅
+GRIN callable / dict-grid / wavelength-dependent	✅	❌
+Wavelength-dependent n(λ)	✅	❌
+Ray starting inside a medium	❌	❌
+Complex refractive index	❌	❌
+Thin-film interference	❌	❌
+Anisotropic media	❌	❌
+CPU-only environments	✅	❌
 
 ## API Overview
-### Symbol	Description
-- **AdvancedRayTracerPBRTGPU**	Main ray tracer class
+### Main classes
+AdvancedRayTracerPBRTGPU(verts, faces, face_mats, materials, device)
+PyTorch BVH tracer. Full feature set, best for flexible research scenarios.
 
-- **BaseGRINField** Base class for GRIN refractive index fields
+WarpTracer(verts, faces, face_mats, materials, device)
+Warp kernel tracer. Best performance, best for large-batch, multi-step simulations.
 
-- **parse_grin_input_to_field**	Parse GRIN config (constant / callable / dict)
+Both expose a compatible trace() API:
 
-- **generate_rays**	Generate rays from various source types
+python
+out = tracer.trace(
+    ray_dict,
+    max_steps=50,
+    ds_init=0.02,
+    fresnel=True,              # legacy flag
+    surface_model=None,        # "fresnel" | "custom" | "coated"
+)
+Light sources
+generate_rays(...) supports grid, random, point_source, area_source, and mesh_source.
 
-- **save_trace_output_to_npz**	Save trace results to compressed NPZ
+I/O
+save_trace_output_to_npz(out, path)
 
-- **export_ray_history_to_stl**	Export ray tracks to STL
-GRIN Field Definition
+export_ray_history_to_stl(out, path)
 
-### You can supply a GRIN field in three ways:
+STEP mesh adapter
+georay.stepmesh_adapter.glue_to_georay(...) converts stepmesh.glue() output into GeoRay inputs.
 
+Physics Validation
+44 unit tests cover:
 
-1. Constant:
+Snell's law (angle vs. analytical, error < 1e-3)
 
-    ```python
-    materials_cfg[1]["grin_field"] = 1.5
-    ```
+Fresnel reflectance (s/p, error < 1e-5)
 
-2. Python function:
+TIR critical angle
 
-    ```python
-    def my_grin(x, y, z, wavelength):
-        return 1.5 - 0.1 * (x ** 2 + y ** 2)
-    
-    materials_cfg[1]["grin_field"] = my_grin
-    ```
-3. Grid (dict):
+Brewster angle
 
-    ```python
-    materials_cfg[1]["grin_field"] = {
-        "x": [0.0, 0.5, 1.0],
-        "y": [0.0, 0.5, 1.0],
-        "z": [0.0, 0.5, 1.0],
-        "values": [[[...]]],  # 3D or 4D array
-    }
-    ```
-### Anisotropic / Polarization-Aware Fields
-For anisotropic media (e.g. birefringent or polarization-sensitive GRIN), subclass BaseGRINField and read self._current_pol / self._current_dop inside forward():
+Interface energy conservation: R + T + A = 1
 
-```python
-from georay import BaseGRINField
-import torch
+Dispersion (Snell angle vs. wavelength)
 
-class BirefringentField(BaseGRINField):
-    def forward(self, r, wavelength=None):
-        pol = self._current_pol   # [N, 3] or None
-        dop = self._current_dop   # [N, 1] or None
+GRIN gradient (4th-order Richardson extrapolation vs. analytical)
 
-        n_avg = 1.5
-        delta_n = 0.01
-        if pol is None:
-            return torch.full((r.shape[0], 1), n_avg, device=r.device), torch.zeros_like(r)
+Multiple-bounce energy invariants
 
-        axis = torch.tensor([1.0, 0.0, 0.0], device=r.device)
-        cos2 = (pol @ axis) ** 2
-        n_eff = n_avg + dop.squeeze(-1) * delta_n * (cos2 - 0.5)
-        grad_n = torch.zeros_like(r)
-        return n_eff.unsqueeze(-1), grad_n
-```
+Diffuse cosine-weighted distribution (mean cos θ ≈ 2/3)
 
-## Performance Notes
-GPU acceleration is automatic when CUDA is available.
+Stokes normalization and DoP
 
-For large scenes, use mixed precision (AMP) in your training loop if embedding GeoRay in a differentiable pipeline.
+Russian roulette invariants
 
-BVH build time is O(F log F) in number of triangles; tracing scales as O(log F) per ray.
+Grazing incidence at 89.5° (numerical stability)
 
-## Limitations
-- Triangle meshes only (no NURBS or implicit surfaces).
+BVH hit / miss
 
-- Diffuse scattering assumes fully randomized polarization.
+NPZ / STL I/O round-trips
 
-- Anisotropic fields must be user-supplied as BaseGRINField subclasses.
+STEP mesh degenerate-triangle handling
 
-- No wavelength-dependent dispersion inside GRIN fields (user must supply n(λ)).
+Run:
+
+bash
+pytest tests/ -v
+Expected: 44 passed.
+
+Colab One-Click Test
+python
+# Install
+!pip install -q "georay[warp] @ git+https://github.com/gwangcode/georay"
+
+# Verify
+import georay
+print(f"version: {georay.__version__}")
+print(f"WarpTracer: {'available' if georay.WarpTracer else 'NOT available'}")
+
+# Quick benchmark
+import torch, trimesh, time
+from georay import AdvancedRayTracerPBRTGPU, WarpTracer, generate_rays
+
+device = torch.device("cuda")
+cube = trimesh.creation.box(extents=[2.0, 2.0, 2.0])
+verts = torch.tensor(cube.vertices, dtype=torch.float32, device=device)
+faces = torch.tensor(cube.faces, dtype=torch.long, device=device)
+fm = torch.zeros((faces.shape[0], 2), dtype=torch.long, device=device)
+fm[:, 0] = 0; fm[:, 1] = 1
+mats = {0: {"n": 1.0}, 1: {"n": 1.5}}
+
+rays = generate_rays(source_type="grid", num_rays=16384,
+                     origin=(0, 0, -3), direction=(0, 0, 1),
+                     bounds=(-0.5, 0.5, -0.5, 0.5),
+                     polarization="s", device=device)
+
+for name, cls in [("PyTorch", AdvancedRayTracerPBRTGPU), ("Warp", WarpTracer)]:
+    tracer = cls(verts, faces, fm, mats, device)
+    tracer.trace(rays, max_steps=2)      # warm-up
+    torch.cuda.synchronize()
+    t0 = time.perf_counter()
+    tracer.trace(rays, max_steps=20)
+    torch.cuda.synchronize()
+    print(f"{name:8s}: {(time.perf_counter() - t0) * 1000:.2f} ms")
+Known Limitations
+WarpTracer
+Scalar material properties only (no wavelength-dependent or dict-grid GRIN)
+
+Parabolic GRIN only (use AdvancedRayTracerPBRTGPU for other GRIN types)
+
+Requires a CUDA GPU (T4 or better)
+
+General
+Rays cannot start inside a medium (API-level gap)
+
+Complex refractive index not supported (metals, absorbing media)
+
+TIR phase retardation not implemented (real-valued Fresnel coefficients only)
+
+No thin-film interference, anisotropy, or volumetric scattering
+
+Project Layout
+text
+georay/
+├── georay/
+│   ├── __init__.py             # Public API
+│   ├── tracer.py               # PyTorch BVH tracer
+│   ├── warp_tracer.py          # Warp kernel tracer
+│   ├── bvh.py                  # Pure PyTorch BVH
+│   ├── grin.py                 # GRIN field definitions
+│   ├── integrator.py           # RK4 stepping
+│   ├── interpolation.py        # GPU interpolation
+│   ├── polarization.py         # Jones-Mueller polarization utilities
+│   ├── sources.py              # Light source generation
+│   ├── io.py                   # NPZ / STL export
+│   └── stepmesh_adapter.py     # STEP → GeoRay adapter
+├── tests/                      # 44 unit tests
+├── examples/                   # Example scripts
+├── pyproject.toml
+├── requirements.txt
+└── README.md
+Citation
+If you use GeoRay in your research, please cite:
+
+bibtex
+@software{georay2026,
+  author = {Wang, Gang},
+  title = {GeoRay: A GPU-Accelerated Ray Tracer for GRIN and Polarization Optics},
+  year = {2026},
+  url = {https://github.com/gwangcode/georay}
+}
+License
+MIT License. See LICENSE for details.
 
 ## Citation
 If you use GeoRay in your research, please cite our paper:
