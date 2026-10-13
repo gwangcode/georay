@@ -1,16 +1,7 @@
 """
 tests/test_medium_interior_start.py
 ====================================
-光线从介质内部出发的场景测试。
-
-覆盖：
-    1. 光线从玻璃内部出发，正确识别 n1=1.5, n2=1.0
-    2. 光线从 GRIN 介质内部出发，RK4 从第一步开始
-    3. 光线在玻璃内部发生 TIR
-    4. 光线从玻璃内部穿出到空气
-
-Run:
-    pytest tests/test_medium_interior_start.py -v -s
+光线从介质内部出发的测试。
 """
 import math
 import pytest
@@ -19,28 +10,31 @@ import trimesh
 
 from georay import AdvancedRayTracerPBRTGPU, generate_rays
 
-
-_HAS_CUDA = torch.cuda.is_available()
-
 try:
     from georay import WarpTracer
     _HAS_WARP_TRACER = WarpTracer is not None
 except ImportError:
+    WarpTracer = None
     _HAS_WARP_TRACER = False
 
+_HAS_CUDA = torch.cuda.is_available()
 
-# ==============================================================================
-# 场景构造
-# ==============================================================================
 
-def make_glass_box(device, extent=2.0):
-    """玻璃盒，外部空气，内部玻璃。"""
-    box = trimesh.creation.box(extents=[extent, extent, extent])
-    verts = torch.tensor(box.vertices, dtype=torch.float32, device=device)
-    faces = torch.tensor(box.faces, dtype=torch.long, device=device)
-    fm = torch.zeros((faces.shape[0], 2), dtype=torch.long, device=device)
-    fm[:, 0] = 0   # 外部
-    fm[:, 1] = 1   # 内部玻璃
+def make_thin_glass_slab(device):
+    """薄玻璃板 z ∈ [-0.5, 0.5]，xy 方向很大 (10×10)。"""
+    verts = torch.tensor([
+        [-5.0, -5.0, -0.5], [5.0, -5.0, -0.5], [5.0, 5.0, -0.5], [-5.0, 5.0, -0.5],
+        [-5.0, -5.0,  0.5], [5.0, -5.0,  0.5], [5.0, 5.0,  0.5], [-5.0, 5.0,  0.5],
+    ], dtype=torch.float32, device=device)
+    faces = torch.tensor([
+        [0, 1, 2], [0, 2, 3],
+        [4, 5, 6], [4, 6, 7],
+    ], dtype=torch.long, device=device)
+    fm = torch.zeros((4, 2), dtype=torch.long, device=device)
+    fm[0:2, 0] = 1
+    fm[0:2, 1] = 0
+    fm[2:4, 0] = 0
+    fm[2:4, 1] = 1
     return verts, faces, fm
 
 
@@ -49,60 +43,41 @@ def make_glass_box(device, extent=2.0):
 # ==============================================================================
 
 def test_ray_starts_inside_glass():
-    """
-    光线从玻璃盒内部出发，方向 +z。
-    第一次命中玻璃-空气界面时：
-      - n1 = 1.5（玻璃）
-      - n2 = 1.0（空气）
-      - 若入射角 > θc，应发生 TIR
-    """
     device = torch.device("cpu")
-    extent = 2.0
-    verts, faces, fm = make_glass_box(device, extent)
+    verts, faces, fm = make_thin_glass_slab(device)
     materials = {
         0: {"n": 1.0, "reflectivity": 1.0, "diffuse": 0.0, "absorptivity": 0.0},
         1: {"n": 1.5, "reflectivity": 1.0, "diffuse": 0.0, "absorptivity": 0.0},
     }
 
-    # 光线从玻璃盒内部（原点）出发，方向 +z
     rays = generate_rays(
         source_type="grid", num_rays=1,
         origin=(0.0, 0.0, 0.0), direction=(0.0, 0.0, 1.0),
         bounds=(0.0, 0.0, 0.0, 0.0),
         polarization="s", device=device,
-        medium_id=1)   # ★ 从玻璃内部出发
+        medium_id=1)
 
     tracer = AdvancedRayTracerPBRTGPU(verts, faces, fm, materials, device)
     out = tracer.trace(rays, max_steps=5, surface_model="fresnel")
 
-    # 第一次界面：n1 = 1.5（玻璃），n2 = 1.0（空气）
     n1_step1 = out["n1"][0, 1, 0].item()
     n2_step1 = out["n2"][0, 1, 0].item()
 
     print("\n[Test 1] Ray starts inside glass")
-    print("  n1 at first interface: {:.4f}".format(n1_step1))
-    print("  n2 at first interface: {:.4f}".format(n2_step1))
+    print("  n1 = {:.4f}, n2 = {:.4f}".format(n1_step1, n2_step1))
 
-    assert abs(n1_step1 - 1.5) < 0.01, \
-        "n1 should be 1.5 (glass), got {:.4f}".format(n1_step1)
-    assert abs(n2_step1 - 1.0) < 0.01, \
-        "n2 should be 1.0 (air), got {:.4f}".format(n2_step1)
-
+    assert abs(n1_step1 - 1.5) < 0.01
+    assert abs(n2_step1 - 1.0) < 0.01
     assert out["energy_conserved"]
 
 
 # ==============================================================================
-# Test 2: 光线从玻璃内部发生 TIR
+# Test 2: 光线从玻璃内部发生 TIR（薄板）
 # ==============================================================================
 
 def test_ray_inside_glass_tir():
-    """
-    光线从玻璃内部（n=1.5）出发，以 50° 入射角（> θc ≈ 41.8°）射向界面。
-    应该发生 TIR，反射率 R ≈ 1。
-    """
     device = torch.device("cpu")
-    extent = 4.0
-    verts, faces, fm = make_glass_box(device, extent)
+    verts, faces, fm = make_thin_glass_slab(device)
     materials = {
         0: {"n": 1.0, "reflectivity": 1.0, "diffuse": 0.0, "absorptivity": 0.0},
         1: {"n": 1.5, "reflectivity": 1.0, "diffuse": 0.0, "absorptivity": 0.0},
@@ -111,7 +86,6 @@ def test_ray_inside_glass_tir():
     theta = math.radians(50.0)
     direction = (math.sin(theta), 0.0, math.cos(theta))
 
-    # 从玻璃内部出发
     rays = generate_rays(
         source_type="grid", num_rays=1,
         origin=(0.0, 0.0, 0.0), direction=direction,
@@ -136,16 +110,13 @@ def test_ray_inside_glass_tir():
 # ==============================================================================
 
 def test_ray_inside_glass_escapes():
-    """法向入射下，光线从玻璃内部穿出到空气（无 TIR）。"""
     device = torch.device("cpu")
-    extent = 2.0
-    verts, faces, fm = make_glass_box(device, extent)
+    verts, faces, fm = make_thin_glass_slab(device)
     materials = {
         0: {"n": 1.0, "reflectivity": 1.0, "diffuse": 0.0, "absorptivity": 0.0},
         1: {"n": 1.5, "reflectivity": 1.0, "diffuse": 0.0, "absorptivity": 0.0},
     }
 
-    # 法向入射，从玻璃内部出发
     rays = generate_rays(
         source_type="grid", num_rays=16,
         origin=(0.0, 0.0, 0.0), direction=(0.0, 0.0, 1.0),
@@ -156,7 +127,6 @@ def test_ray_inside_glass_escapes():
     tracer = AdvancedRayTracerPBRTGPU(verts, faces, fm, materials, device)
     out = tracer.trace(rays, max_steps=10, surface_model="fresnel")
 
-    # 所有光线都应逃逸
     final_active = out["active"][:, -1]
     n_stuck = final_active.sum().item()
 
@@ -172,10 +142,6 @@ def test_ray_inside_glass_escapes():
 # ==============================================================================
 
 def test_ray_inside_grin_starts_stepping():
-    """
-    光线从抛物线 GRIN 介质内部出发，离轴起点。
-    RK4 步进应从第一步就对光线施加弯折。
-    """
     device = torch.device("cpu")
     box = trimesh.creation.box(extents=[2.0, 2.0, 4.0])
     verts = torch.tensor(box.vertices, dtype=torch.float32, device=device)
@@ -189,14 +155,10 @@ def test_ray_inside_grin_starts_stepping():
 
     materials = {
         0: {"n": 1.0, "reflectivity": 0.0, "diffuse": 0.0, "absorptivity": 0.0},
-        1: {
-            "n": 1.5,
-            "reflectivity": 0.0, "diffuse": 0.0, "absorptivity": 0.0,
-            "grin_field": parabolic_grin,
-        },
+        1: {"n": 1.5, "reflectivity": 0.0, "diffuse": 0.0,
+            "absorptivity": 0.0, "grin_field": parabolic_grin},
     }
 
-    # 从 GRIN 介质内部（x=0.3, y=0, z=-1.0）出发
     rays = generate_rays(
         source_type="grid", num_rays=1,
         origin=(0.3, 0.0, -1.0), direction=(0.0, 0.0, 1.0),
@@ -216,10 +178,7 @@ def test_ray_inside_grin_starts_stepping():
     print("\n[Test 4] Ray starts inside GRIN medium")
     print("  x_start = {:.4f}, x_end = {:.4f}".format(x_start, x_end))
 
-    # 从内侧出发，x 应向轴收敛
-    assert abs(x_end) < abs(x_start), \
-        "GRIN should bend ray: x_start={:.4f}, x_end={:.4f}".format(
-            x_start, x_end)
+    assert abs(x_end) < abs(x_start)
 
 
 # ==============================================================================
@@ -229,10 +188,8 @@ def test_ray_inside_grin_starts_stepping():
 @pytest.mark.skipif(not (_HAS_CUDA and _HAS_WARP_TRACER),
                      reason="WarpTracer requires CUDA + warp-lang")
 def test_warp_ray_inside_glass():
-    """WarpTracer 也应支持从介质内部出发。"""
     device = torch.device("cuda")
-    extent = 2.0
-    verts, faces, fm = make_glass_box(device, extent)
+    verts, faces, fm = make_thin_glass_slab(device)
     materials = {
         0: {"n": 1.0, "reflectivity": 1.0, "diffuse": 0.0, "absorptivity": 0.0},
         1: {"n": 1.5, "reflectivity": 1.0, "diffuse": 0.0, "absorptivity": 0.0},
@@ -257,10 +214,6 @@ def test_warp_ray_inside_glass():
     assert abs(n1_step1 - 1.5) < 0.01
     assert abs(n2_step1 - 1.0) < 0.01
 
-
-# ==============================================================================
-# Entry point
-# ==============================================================================
 
 if __name__ == "__main__":
     import sys
