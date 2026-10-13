@@ -3,6 +3,11 @@
 GPU 优化点：
     * `_choose_perpendicular` 用 in-place 操作和 `.where` 减少临时张量分配。
     * `rotate_stokes_reference` 减少不必要的中间量。
+
+物理修复（v1.2）：
+    * `_choose_perpendicular` 在 |d.z| > 0.99 时用 (1, 0, 0) 作参考轴，
+      而不是 (0, 1, 0)。这保证了 near-normal（θi < ~8°）时 s 方向
+      仍是 y 轴（真正的 s），而不是落入入射面内变成 p 方向。
 """
 import torch
 
@@ -10,15 +15,24 @@ import torch
 def _choose_perpendicular(d):
     """Physical s-polarization direction = cross(ref, d).
 
-    ★ 优化：用 in-place 赋值和 torch.where 减少中间张量。
+    ★ v1.2 修复：
+        当 |d.z| > 0.99（near-normal 入射）时，用 (1, 0, 0) 作参考轴。
+        原因：
+            d ≈ (sinθ, 0, cosθ) 且 θ 很小时，
+            cross((1, 0, 0), d) ≈ (0, -cosθ, 0) → y 方向（真正的 s）
+            cross((0, 1, 0), d) ≈ (cosθ, 0, -sinθ) → 入射面内（p 方向，错误）
+
+    这样保证 s 方向在整个入射角范围内都接近垂直于入射面（y 轴），
+    与 Fresnel 公式中 s / p 定义一致。
     """
     device = d.device
-    # ref 向量：默认 (0, 0, 1)，当 d 接近 ±z 时改用 (0, 1, 0)
+    # 默认参考轴：z 轴
     ref = torch.zeros_like(d)
     ref[..., 2] = 1.0
+
+    # ★ near-z 时切换到 x 轴
     near_z = d[..., 2].abs() > 0.99
-    # in-place 只在 near_z 处替换
-    ref[near_z] = torch.tensor([0.0, 1.0, 0.0], device=device, dtype=d.dtype)
+    ref[near_z] = torch.tensor([1.0, 0.0, 0.0], device=device, dtype=d.dtype)
 
     s = torch.cross(ref, d, dim=-1)
     norm = s.norm(dim=-1, keepdim=True)
@@ -26,7 +40,7 @@ def _choose_perpendicular(d):
     safe_norm = norm.clamp_min(eps)
     s_normalized = s / safe_norm
 
-    # fallback：当 norm < eps 时（d 与 ref 平行）用 x 轴
+    # fallback：d 与 ref 平行时（罕见），用 x 轴
     fallback = torch.zeros_like(s)
     fallback[..., 0] = 1.0
     degenerate = (norm < eps)
@@ -34,7 +48,10 @@ def _choose_perpendicular(d):
 
 
 def rotate_stokes_reference(stokes, s_old, s_new, d):
-    """Rotate Stokes vector from (s_old, p_old) basis to (s_new, p_new) basis."""
+    """Rotate Stokes vector from (s_old, p_old) basis to (s_new, p_new) basis.
+
+    只旋转 S1 / S2（线性偏振分量）。S0 和 S3（圆偏振分量）不变。
+    """
     cos_t = torch.sum(s_old * s_new, dim=-1, keepdim=True)
     cross_val = torch.cross(s_old, s_new, dim=-1)
     sin_t = torch.sum(cross_val * d, dim=-1, keepdim=True)
@@ -47,7 +64,20 @@ def rotate_stokes_reference(stokes, s_old, s_new, d):
 
 
 def apply_jones_mueller(stokes, r_s, r_p):
-    """Apply Jones matrix diag(r_s, r_p) to a Stokes vector (normalized to S0=1)."""
+    """Apply Jones matrix diag(r_s, r_p) to a Stokes vector (normalized to S0=1).
+
+    标准 Mueller 矩阵：
+        a = 0.5·(r_s² + r_p²)
+        b = 0.5·(r_s² − r_p²)
+        c = r_s · r_p
+
+        S0' = a·S0 + b·S1
+        S1' = b·S0 + a·S1
+        S2' = c·S2
+        S3' = c·S3
+
+    输出归一化为 S0' = 1。
+    """
     a = 0.5 * (r_s * r_s + r_p * r_p)
     b = 0.5 * (r_s * r_s - r_p * r_p)
     c = r_s * r_p
@@ -62,13 +92,20 @@ def apply_jones_mueller(stokes, r_s, r_p):
 
 
 def randomize_stokes_diffuse(stokes):
-    """Fully randomized Stokes vector (unpolarized)."""
+    """Fully randomized Stokes vector (unpolarized).
+
+    漫反射后偏振完全随机化：S0 = 1，S1 = S2 = S3 = 0。
+    """
     return torch.cat([torch.ones_like(stokes[..., 0:1]),
                       torch.zeros_like(stokes[..., 1:4])], dim=-1)
 
 
 def stokes_to_pol_vector(stokes, s_ref, p_ref):
-    """Derive main polarization direction from Stokes vector."""
+    """Derive main polarization direction from Stokes vector.
+
+    偏振主轴方向：ψ = 0.5 · atan2(S2, S1)
+    pol = cos(ψ)·s_ref + sin(ψ)·p_ref
+    """
     S1 = stokes[..., 1:2]
     S2 = stokes[..., 2:3]
     psi = 0.5 * torch.atan2(S2, S1)
@@ -77,7 +114,7 @@ def stokes_to_pol_vector(stokes, s_ref, p_ref):
 
 
 def degree_of_polarization(stokes):
-    """DoP = sqrt(S1^2 + S2^2 + S3^2) / S0."""
+    """DoP = sqrt(S1² + S2² + S3²) / S0."""
     S0 = stokes[..., 0:1]
     S1 = stokes[..., 1:2]
     S2 = stokes[..., 2:3]
