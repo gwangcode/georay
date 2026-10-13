@@ -431,8 +431,8 @@ verts, faces, face_mats = glue_to_georay(
     outside_material_id=0,
 )
 ```
-Project Layout
-### text
+### Project Layout
+```text
 georay/
 ├── georay/
 │   ├── __init__.py             # Public API
@@ -451,6 +451,7 @@ georay/
 ├── pyproject.toml
 ├── requirements.txt
 └── README.md
+```
 
 ### Material Configuration Reference
 ```python
