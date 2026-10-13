@@ -58,7 +58,7 @@ GeoRay is a research-grade ray tracing library with full Stokes polarization tra
 
 - Export ray tracks to STL
 
-- STEP mesh adapter (stepmesh.glue() → GeoRay)
+- STEP mesh adapter (`stepmesh.glue()` → GeoRay)
 
 ## Installation
 **Basic install (PyTorch BVH only)**
