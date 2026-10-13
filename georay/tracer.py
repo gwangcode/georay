@@ -16,6 +16,88 @@ from .polarization import (
     degree_of_polarization,
 )
 
+def _validate_materials_cfg(materials_cfg, face_materials):
+    """
+    验证 materials_cfg 和 face_materials 的合法性。
+
+    在 tracer.__init__ 早期调用，让非法配置在构造时立即报错，
+    而不是追踪中途崩溃。
+
+    Raises:
+        ValueError: 配置不合法。
+    """
+    if not isinstance(materials_cfg, dict) or len(materials_cfg) == 0:
+        raise ValueError(
+            "materials_cfg must be a non-empty dict, got {}".format(
+                type(materials_cfg)))
+
+    # 检查 face_materials 引用的所有材质 ID 都定义在 materials_cfg 中
+    if face_materials is not None and face_materials.numel() > 0:
+        unique_ids = torch.unique(face_materials).tolist()
+        defined = set(materials_cfg.keys())
+        missing = [m for m in unique_ids if m not in defined]
+        if missing:
+            raise ValueError(
+                "face_materials references undefined material IDs: {}. "
+                "Defined IDs: {}".format(sorted(missing), sorted(defined)))
+
+    for mat_id, cfg in materials_cfg.items():
+        if not isinstance(mat_id, int):
+            raise ValueError(
+                "Material ID must be int, got {}: {}".format(
+                    type(mat_id), mat_id))
+
+        if not isinstance(cfg, dict):
+            raise ValueError(
+                "materials_cfg[{}] must be a dict, got {}".format(
+                    mat_id, type(cfg)))
+
+        # n 必须存在或使用默认值；如果显式给出必须 > 0
+        if "n" in cfg:
+            n_val = cfg["n"]
+            if isinstance(n_val, (int, float)):
+                if n_val <= 0:
+                    raise ValueError(
+                        "materials_cfg[{}]['n'] = {} must be > 0".format(
+                            mat_id, n_val))
+
+        # reflectivity / diffuse / absorptivity 若为标量应在 [0, 1]
+        for field in ("reflectivity", "diffuse", "absorptivity"):
+            if field in cfg:
+                v = cfg[field]
+                if isinstance(v, (int, float)):
+                    if v < 0.0 or v > 1.0:
+                        raise ValueError(
+                            "materials_cfg[{}]['{}'] = {} must be in [0, 1]".format(
+                                mat_id, field, v))
+
+        # grin_field 若存在必须是 dict 或 callable
+        if "grin_field" in cfg and cfg["grin_field"] is not None:
+            gf = cfg["grin_field"]
+            if not (isinstance(gf, dict) or callable(gf)):
+                raise ValueError(
+                    "materials_cfg[{}]['grin_field'] must be dict or callable, "
+                    "got {}".format(mat_id, type(gf)))
+
+            if isinstance(gf, dict):
+                gtype = gf.get("type", "")
+                valid_types = ("parabolic", "grid", "grid_4d", "callable")
+                if gtype not in valid_types:
+                    raise ValueError(
+                        "materials_cfg[{}]['grin_field']['type'] = '{}' "
+                        "must be one of {}".format(
+                            mat_id, gtype, valid_types))
+
+                if gtype == "parabolic":
+                    if "n0" in gf and gf["n0"] <= 0:
+                        raise ValueError(
+                            "materials_cfg[{}]['grin_field']['n0'] = {} "
+                            "must be > 0".format(mat_id, gf["n0"]))
+                    if "A" in gf and gf["A"] < 0:
+                        raise ValueError(
+                            "materials_cfg[{}]['grin_field']['A'] = {} "
+                            "must be >= 0".format(mat_id, gf["A"]))
+
 
 class AdvancedRayTracerPBRTGPU:
     """GPU-accelerated ray tracer with BVH, GRIN, and polarization support.
@@ -31,6 +113,7 @@ class AdvancedRayTracerPBRTGPU:
     """
 
     def __init__(self, vertices, faces, face_materials, materials_cfg, device):
+        _validate_materials_cfg(materials_cfg, face_materials)
         self.device = device
         self.intersector = BVHMeshIntersector(vertices, faces, device)
         self.face_materials = face_materials.to(dtype=torch.long, device=device)
