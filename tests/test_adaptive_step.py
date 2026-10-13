@@ -1,0 +1,100 @@
+"""
+tests/test_adaptive_step.py
+============================
+自适应步长 RK4 的有效性验证。
+"""
+import torch
+import trimesh
+import pytest
+
+from georay import AdvancedRayTracerPBRTGPU, generate_rays
+
+
+def make_grin_box(device, extents=(1.0, 1.0, 4.0)):
+    box = trimesh.creation.box(extents=list(extents))
+    verts = torch.tensor(box.vertices, dtype=torch.float32, device=device)
+    faces = torch.tensor(box.faces, dtype=torch.long, device=device)
+    fm = torch.zeros((faces.shape[0], 2), dtype=torch.long, device=device)
+    fm[:, 0] = 0
+    fm[:, 1] = 1
+    return verts, faces, fm
+
+
+def test_adaptive_step_ds_history_varies():
+    """自适应 RK4 的步长历史应有变化（非恒定）。"""
+    device = torch.device("cpu")
+    verts, faces, fm = make_grin_box(device)
+
+    def strong_grin(x, y, z, wl):
+        return 1.5 - 0.4 * (x ** 2 + y ** 2)
+
+    materials = {
+        0: {"n": 1.0, "reflectivity": 0.0, "diffuse": 0.0, "absorptivity": 0.0},
+        1: {"n": 1.5, "reflectivity": 0.0, "diffuse": 0.0,
+            "absorptivity": 0.0, "grin_field": strong_grin},
+    }
+
+    rays = generate_rays(
+        source_type="grid", num_rays=1,
+        origin=(0.5, 0.0, -3.0), direction=(0.0, 0.0, 1.0),
+        bounds=(0.0, 0.0, 0.0, 0.0),
+        polarization="s", device=device)
+
+    tracer = AdvancedRayTracerPBRTGPU(verts, faces, fm, materials, device)
+    out = tracer.trace(rays, max_steps=200, ds_init=0.02,
+                        ds_min=1e-4, ds_max=0.1,
+                        rk_tol=1e-4, fresnel=False)
+
+    ds_hist = out["ds_history"][0]
+    ds_range = (ds_hist.max() - ds_hist.min()).item()
+
+    print("\n[Test 1] Adaptive step ds history")
+    print("  ds range: [{:.6f}, {:.6f}]".format(
+        ds_hist.min().item(), ds_hist.max().item()))
+    print("  ds variation: {:.6f}".format(ds_range))
+
+    assert ds_range > 1e-4, \
+        "Adaptive step should vary ds, but range is {:.6e}".format(ds_range)
+
+
+def test_adaptive_step_within_bounds():
+    """步长应始终在 [ds_min, ds_max] 范围内。"""
+    device = torch.device("cpu")
+    verts, faces, fm = make_grin_box(device)
+
+    def grin_fn(x, y, z, wl):
+        return 1.5 - 0.2 * (x ** 2 + y ** 2)
+
+    materials = {
+        0: {"n": 1.0, "reflectivity": 0.0, "diffuse": 0.0, "absorptivity": 0.0},
+        1: {"n": 1.5, "reflectivity": 0.0, "diffuse": 0.0,
+            "absorptivity": 0.0, "grin_field": grin_fn},
+    }
+
+    rays = generate_rays(
+        source_type="grid", num_rays=1,
+        origin=(0.3, 0.0, -3.0), direction=(0.0, 0.0, 1.0),
+        bounds=(0.0, 0.0, 0.0, 0.0),
+        polarization="s", device=device)
+
+    ds_min, ds_max = 1e-3, 0.08
+    tracer = AdvancedRayTracerPBRTGPU(verts, faces, fm, materials, device)
+    out = tracer.trace(rays, max_steps=200, ds_init=0.02,
+                        ds_min=ds_min, ds_max=ds_max, fresnel=False)
+
+    ds_hist = out["ds_history"][0]
+    # 只检查 active 步数内的值（末步可能被 clamp）
+    active_steps = out["active"][0].sum().item()
+
+    print("\n[Test 2] Adaptive step within bounds")
+    print("  ds_min = {:.6f}, ds_max = {:.6f}".format(ds_min, ds_max))
+    print("  Actual range: [{:.6f}, {:.6f}]".format(
+        ds_hist.min().item(), ds_hist.max().item()))
+
+    assert ds_hist.min().item() >= ds_min * 0.99
+    assert ds_hist.max().item() <= ds_max * 1.01
+
+
+if __name__ == "__main__":
+    import sys
+    sys.exit(pytest.main([__file__, "-v", "-s"]))
