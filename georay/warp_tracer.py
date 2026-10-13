@@ -1,6 +1,6 @@
 # georay/warp_tracer.py
 """
-全 Warp 内核实现的 GeoRay tracer（完整版）。
+全 Warp 内核实现的 GeoRay tracer（callable GRIN 支持版）。
 
 支持：
     * Fresnel (s/p 偏振加权) + TIR
@@ -10,7 +10,7 @@
     * Diffuse 半球采样
     * surface_model: "fresnel" / "custom" / "coated"
 
-属性 LUT（n / reflectivity / diffuse / absorptivity 都支持）：
+属性 LUT（n / reflectivity / diffuse / absorptivity）：
     * kind=0: 标量常量
     * kind=1: 1D 波长 LUT
     * kind=2: 2D 波长×角度 LUT
@@ -19,7 +19,7 @@
 
 GRIN 场：
     * parabolic 内置 RK4
-    * callable (@wp.func) 编译期内联
+    * callable Python 函数 → 自动采样为 3D grid → 走 grid 路径
     * 3D dict-grid  三线性插值 + 解析梯度
     * 4D dict-grid  四线性插值 + 中心差分梯度
 """
@@ -66,7 +66,7 @@ def compute_face_normal(v0: wp.vec3, v1: wp.vec3, v2: wp.vec3) -> wp.vec3:
 def choose_perpendicular(d: wp.vec3) -> wp.vec3:
     ref = wp.vec3(0.0, 0.0, 1.0)
     if wp.abs(d[2]) > 0.99:
-        ref = wp.vec3(0.0, 1.0, 0.0)
+        ref = wp.vec3(1.0, 0.0, 0.0)
     s = wp.cross(ref, d)
     ln = wp.length(s)
     if ln < 1e-12:
@@ -89,7 +89,7 @@ def rotate_stokes_to_new_s(
 
 
 # ==============================================================================
-# LUT 插值函数（无嵌套函数，无 for 内 return）
+# LUT 插值函数
 # ==============================================================================
 
 @wp.func
@@ -100,7 +100,6 @@ def interp_1d_full(
     offset: wp.int32,
     K: wp.int32,
 ):
-    """1D 线性插值。用固定上限循环 + flag 避免 for 内 return。"""
     if K <= 0:
         return wp.float32(0.0)
     if K == 1:
@@ -141,7 +140,6 @@ def find_interval_1d(
     offset: wp.int32,
     K: wp.int32,
 ):
-    """返回 (i, t)，grid[offset+i] <= x < grid[offset+i+1]。"""
     if K <= 1:
         return wp.int32(0), wp.float32(0.0)
 
@@ -184,7 +182,6 @@ def interp_2d_full(
     y_off: wp.int32, y_size: wp.int32,
     val_off: wp.int32,
 ):
-    """2D 双线性插值。values 行主序 [x_size * y_size]。"""
     if x_size <= 1 or y_size <= 1:
         if x_size > 0 and y_size > 0:
             return values[val_off]
@@ -220,7 +217,6 @@ def interp_3d_grin(
     z_off: wp.int32, z_size: wp.int32,
     val_off: wp.int32,
 ):
-    """3D 三线性插值。values 行主序 [Nx * Ny * Nz]。"""
     if x_size <= 1 or y_size <= 1 or z_size <= 1:
         if x_size > 0 and y_size > 0 and z_size > 0:
             return values[val_off]
@@ -276,7 +272,6 @@ def interp_3d_grin_and_grad(
     z_off: wp.int32, z_size: wp.int32,
     val_off: wp.int32,
 ):
-    """3D 三线性插值 + 解析梯度。"""
     n_val = interp_3d_grin(x, y, z, gx, gy, gz, values,
                             x_off, x_size, y_off, y_size, z_off, z_size, val_off)
 
@@ -310,7 +305,6 @@ def interp_3d_grin_and_grad(
     v110 = values[i110]
     v111 = values[i111]
 
-    # ∂n/∂x
     v0_lo_x = (v000 * (1.0 - tz) + v001 * tz) * (1.0 - ty) + \
               (v010 * (1.0 - tz) + v011 * tz) * ty
     v0_hi_x = (v100 * (1.0 - tz) + v101 * tz) * (1.0 - ty) + \
@@ -318,7 +312,6 @@ def interp_3d_grin_and_grad(
     dx = gx[x_off + ix + 1] - gx[x_off + ix]
     dndx = (v0_hi_x - v0_lo_x) / (dx + 1e-12)
 
-    # ∂n/∂y
     v0_lo_y = (v000 * (1.0 - tx) + v100 * tx) * (1.0 - tz) + \
               (v001 * (1.0 - tx) + v101 * tx) * tz
     v0_hi_y = (v010 * (1.0 - tx) + v110 * tx) * (1.0 - tz) + \
@@ -326,7 +319,6 @@ def interp_3d_grin_and_grad(
     dy = gy[y_off + iy + 1] - gy[y_off + iy]
     dndy = (v0_hi_y - v0_lo_y) / (dy + 1e-12)
 
-    # ∂n/∂z
     v0_lo_z = (v000 * (1.0 - tx) + v100 * tx) * (1.0 - ty) + \
               (v010 * (1.0 - tx) + v110 * tx) * ty
     v0_hi_z = (v001 * (1.0 - tx) + v101 * tx) * (1.0 - ty) + \
@@ -351,7 +343,6 @@ def interp_4d_grin_wl(
     wl_off: wp.int32, wl_size: wp.int32,
     val_off: wp.int32,
 ):
-    """4D 四线性插值。values 行主序 [Nx * Ny * Nz * Nw]。"""
     if (x_size <= 1 or y_size <= 1 or z_size <= 1 or wl_size <= 1):
         if x_size > 0 and y_size > 0 and z_size > 0 and wl_size > 0:
             return values[val_off]
@@ -368,7 +359,6 @@ def interp_4d_grin_wl(
     base_ix = val_off + ix * yzw
     base_ix1 = val_off + (ix + 1) * yzw
 
-    # (ix, iy)
     base_00 = base_ix + iy * zw + iz * wl_size + iw
     v_z0_w0 = values[base_00]
     v_z0_w1 = values[base_00 + 1]
@@ -378,7 +368,6 @@ def interp_4d_grin_wl(
     v_z1 = v_z1_w0 * (1.0 - tw) + v_z1_w1 * tw
     v00 = v_z0 * (1.0 - tz) + v_z1 * tz
 
-    # (ix, iy+1)
     base_01 = base_ix + (iy + 1) * zw + iz * wl_size + iw
     v_z0_w0 = values[base_01]
     v_z0_w1 = values[base_01 + 1]
@@ -388,7 +377,6 @@ def interp_4d_grin_wl(
     v_z1 = v_z1_w0 * (1.0 - tw) + v_z1_w1 * tw
     v01 = v_z0 * (1.0 - tz) + v_z1 * tz
 
-    # (ix+1, iy)
     base_10 = base_ix1 + iy * zw + iz * wl_size + iw
     v_z0_w0 = values[base_10]
     v_z0_w1 = values[base_10 + 1]
@@ -398,7 +386,6 @@ def interp_4d_grin_wl(
     v_z1 = v_z1_w0 * (1.0 - tw) + v_z1_w1 * tw
     v10 = v_z0 * (1.0 - tz) + v_z1 * tz
 
-    # (ix+1, iy+1)
     base_11 = base_ix1 + (iy + 1) * zw + iz * wl_size + iw
     v_z0_w0 = values[base_11]
     v_z0_w1 = values[base_11 + 1]
@@ -427,7 +414,6 @@ def interp_4d_grin_wl_and_grad(
     wl_off: wp.int32, wl_size: wp.int32,
     val_off: wp.int32,
 ):
-    """4D 插值 + 中心差分梯度。"""
     n_val = interp_4d_grin_wl(x, y, z, wl, gx, gy, gz, gwl, values,
                                 x_off, x_size, y_off, y_size,
                                 z_off, z_size, wl_off, wl_size, val_off)
@@ -472,7 +458,7 @@ def interp_4d_grin_wl_and_grad(
 
 
 # ==============================================================================
-# GRIN 抛物线（内置）
+# GRIN 抛物线
 # ==============================================================================
 
 @wp.func
@@ -485,7 +471,7 @@ def eval_grin_parabolic(r: wp.vec3, n0: wp.float32, A: wp.float32):
 
 
 # ==============================================================================
-# 属性求值（统一入口）
+# 属性求值
 # ==============================================================================
 
 @wp.func
@@ -716,11 +702,7 @@ def trace_kernel(
     step = wp.int32(0)
 
     while active == 1 and step < max_steps:
-        # ============================================================
-        # 1. 求交 + 推开自相交（不消耗 step）
-        #    ★ 关键修复：把 skip_guard 提到循环开头，
-        #       这样 GRIN 判断基于"真正的下一个命中"。
-        # ============================================================
+        # 求交 + 推开自相交（不消耗 step）
         q = wp.mesh_query_ray(mesh_id, origin, d, far)
         skip_guard = wp.int32(0)
         while skip_guard < 8:
@@ -732,18 +714,12 @@ def trace_kernel(
             q = wp.mesh_query_ray(mesh_id, origin, d, far)
             skip_guard = skip_guard + 1
 
-        # ============================================================
-        # 2. 判断当前介质 GRIN 状态
-        # ============================================================
         gkind = wp.int32(0)
         if medium_id >= 0:
             if medium_id < num_media:
                 gkind = grin_kind[medium_id]
         g_active = (gkind > 0)
 
-        # ============================================================
-        # 3. 决策：GRIN 步进 vs 表面交互
-        # ============================================================
         if g_active and ((not q.result) or q.t > ds):
             # ========================================================
             # GRIN RK4 步进
@@ -812,7 +788,6 @@ def trace_kernel(
                 prop_values)
             new_d = wp.normalize(p_next / new_n)
 
-            # s_ref 更新
             s_proj = wp.dot(s_ref, new_d)
             s_new = s_ref - s_proj * new_d
             s_new_len = wp.length(s_new)
@@ -845,7 +820,7 @@ def trace_kernel(
 
         else:
             # ========================================================
-            # 表面交互（q 已经是有效命中，不需要再做 skip_guard）
+            # 表面交互
             # ========================================================
             cur_refl = wp.float32(0.0)
             cur_trans = wp.float32(0.0)
@@ -854,7 +829,6 @@ def trace_kernel(
             cur_n2 = wp.float32(1.0)
 
             if not q.result:
-                # 逃逸
                 origin = origin + d * 1.0
                 active = wp.int32(0)
             else:
@@ -885,7 +859,6 @@ def trace_kernel(
                     n1_id = mat_back
                     n2_id = mat_front
 
-                # ---- n1 ----
                 gkind_1 = wp.int32(0)
                 if n1_id >= 0:
                     if n1_id < num_media:
@@ -911,7 +884,6 @@ def trace_kernel(
                         gz, gz_offset, gz_size,
                         prop_values)
 
-                # ---- n2 ----
                 gkind_2 = wp.int32(0)
                 if n2_id >= 0:
                     if n2_id < num_media:
@@ -1118,8 +1090,9 @@ def trace_kernel(
         hist_n2[tid, step] = 1.0
         hist_dop[tid, step] = wp.sqrt(S1 * S1 + S2 * S2 + S3 * S3) / (1.0 + 1e-12)
 
+
 # ==============================================================================
-# LUT Builder
+# LUT 构建器
 # ==============================================================================
 
 PROP_N = 0
@@ -1281,6 +1254,15 @@ class WarpTracer:
 
     def __init__(self, vertices, faces, face_materials, materials_cfg, device,
                  grin_callable=None):
+        """
+        Args:
+            vertices, faces, face_materials: 网格数据。
+            materials_cfg: 材质配置 dict。
+            device: torch.device。
+            grin_callable: 可选，Python 函数 f(x, y, z) -> n。
+                支持标量或 numpy 数组输入。
+                在 __init__ 里被采样成 3D grid，之后走 grid 路径。
+        """
         self.device = device
         self.warp_device = "cuda:0" if str(device).startswith("cuda") else "cpu"
         self.grin_callable = grin_callable
@@ -1308,6 +1290,9 @@ class WarpTracer:
         fm_np = face_materials.detach().cpu().numpy().astype(np.int32)
         self.face_materials = wp.array(fm_np, dtype=wp.int32, ndim=2,
                                          device=self.warp_device)
+
+        mesh_min = verts_np.min(axis=0)
+        mesh_max = verts_np.max(axis=0)
 
         max_mat = max(materials_cfg.keys()) + 1
         self.num_media = max_mat
@@ -1340,8 +1325,7 @@ class WarpTracer:
                         y = np.asarray(gf["y"], dtype=np.float32)
                         z = np.asarray(gf["z"], dtype=np.float32)
                         values = np.asarray(gf["values"], dtype=np.float32)
-                        assert values.shape == (len(x), len(y), len(z)), \
-                            f"GRIN grid shape {values.shape} != ({len(x)}, {len(y)}, {len(z)})"
+                        assert values.shape == (len(x), len(y), len(z))
                         lut.add_grin_3d(k, x, y, z, values)
                         grin_kind_arr[k] = 3
                     elif gtype == "grid_4d":
@@ -1350,20 +1334,28 @@ class WarpTracer:
                         z = np.asarray(gf["z"], dtype=np.float32)
                         wl = np.asarray(gf["wavelengths_nm"], dtype=np.float32)
                         values = np.asarray(gf["values"], dtype=np.float32)
-                        assert values.shape == (len(x), len(y), len(z), len(wl)), \
-                            f"GRIN 4D shape {values.shape}"
+                        assert values.shape == (len(x), len(y), len(z), len(wl))
                         lut.add_grin_4d(k, x, y, z, wl, values)
                         grin_kind_arr[k] = 4
                     elif gtype == "callable":
                         if grin_callable is None:
                             raise ValueError(
-                                f"Material {k} uses grin_field={{'type': 'callable'}} "
-                                f"but grin_callable is None")
-                        grin_kind_arr[k] = 2
+                                "Material {} uses grin_field={{'type': 'callable'}} "
+                                "but grin_callable is None".format(k))
+                        # ★ 采样 callable 为 3D grid
+                        bounds = gf.get("bounds", None)
+                        resolution = tuple(gf.get("resolution", (32, 32, 32)))
+                        x_nodes, y_nodes, z_nodes, values = \
+                            self._sample_callable_to_grid(
+                                grin_callable, bounds, resolution,
+                                (mesh_min, mesh_max))
+                        lut.add_grin_3d(k, x_nodes, y_nodes, z_nodes, values)
+                        grin_kind_arr[k] = 3
                     else:
-                        raise NotImplementedError(f"Unsupported grin type: {gtype}")
+                        raise NotImplementedError(
+                            "Unsupported grin type: {}".format(gtype))
                 else:
-                    raise NotImplementedError(f"grin_field must be dict")
+                    raise NotImplementedError("grin_field must be dict")
 
         lut_arrays = lut.build(self.warp_device)
         self.prop_kind = lut_arrays["prop_kind"]
@@ -1387,9 +1379,65 @@ class WarpTracer:
         self.gz_offset = lut_arrays["gz_offset"]
         self.gz_size = lut_arrays["gz_size"]
 
-        self.grin_kind = wp.array(grin_kind_arr, dtype=wp.int32, device=self.warp_device)
-        self.grin_n0 = wp.array(grin_n0_arr, dtype=wp.float32, device=self.warp_device)
-        self.grin_A = wp.array(grin_A_arr, dtype=wp.float32, device=self.warp_device)
+        self.grin_kind = wp.array(grin_kind_arr, dtype=wp.int32,
+                                    device=self.warp_device)
+        self.grin_n0 = wp.array(grin_n0_arr, dtype=wp.float32,
+                                  device=self.warp_device)
+        self.grin_A = wp.array(grin_A_arr, dtype=wp.float32,
+                                 device=self.warp_device)
+
+    @staticmethod
+    def _sample_callable_to_grid(func, bounds, resolution, mesh_bbox):
+        """
+        把 Python callable 采样成 3D grid。
+
+        Args:
+            func: Python 函数 f(x, y, z) -> n，支持标量或 numpy 数组。
+            bounds: (xmin, xmax, ymin, ymax, zmin, zmax) 或 None。
+            resolution: (nx, ny, nz) 采样点数。
+            mesh_bbox: (mesh_min, mesh_max) numpy 数组。
+
+        Returns:
+            (x_nodes, y_nodes, z_nodes, values)
+        """
+        nx, ny, nz = resolution
+
+        if bounds is None:
+            mesh_min, mesh_max = mesh_bbox
+            span = mesh_max - mesh_min
+            margin = 0.2 * span
+            xmin = float(mesh_min[0] - margin[0])
+            xmax = float(mesh_max[0] + margin[0])
+            ymin = float(mesh_min[1] - margin[1])
+            ymax = float(mesh_max[1] + margin[1])
+            zmin = float(mesh_min[2] - margin[2])
+            zmax = float(mesh_max[2] + margin[2])
+        else:
+            xmin, xmax, ymin, ymax, zmin, zmax = bounds
+
+        x_nodes = np.linspace(xmin, xmax, nx).astype(np.float32)
+        y_nodes = np.linspace(ymin, ymax, ny).astype(np.float32)
+        z_nodes = np.linspace(zmin, zmax, nz).astype(np.float32)
+
+        X, Y, Z = np.meshgrid(x_nodes, y_nodes, z_nodes, indexing="ij")
+        try:
+            values = func(X, Y, Z)
+        except (TypeError, ValueError):
+            values = np.zeros_like(X)
+            for i in range(nx):
+                for j in range(ny):
+                    for k in range(nz):
+                        values[i, j, k] = float(func(X[i, j, k],
+                                                     Y[i, j, k],
+                                                     Z[i, j, k]))
+
+        values = np.asarray(values, dtype=np.float32)
+        if values.shape != (nx, ny, nz):
+            raise ValueError(
+                "Callable returned shape {} but expected ({}, {}, {})".format(
+                    values.shape, nx, ny, nz))
+
+        return x_nodes, y_nodes, z_nodes, values
 
     @staticmethod
     def _add_property(lut, mat_id, prop_id, cfg):
@@ -1399,7 +1447,7 @@ class WarpTracer:
 
         if not isinstance(cfg, dict):
             raise NotImplementedError(
-                f"Property config must be scalar or dict, got {type(cfg)}")
+                "Property config must be scalar or dict, got {}".format(type(cfg)))
 
         if "wavelengths_nm" in cfg and "cos_theta" in cfg and "values" in cfg:
             lut.add_2d_lut(mat_id, prop_id,
@@ -1410,7 +1458,7 @@ class WarpTracer:
             lut.add_wl_lut(mat_id, prop_id, cfg["wavelengths_nm"], cfg["values"])
             return
 
-        raise NotImplementedError(f"Unrecognized property config: {cfg}")
+        raise NotImplementedError("Unrecognized property config: {}".format(cfg))
 
     def trace(self, ray_dict, max_steps=50, ds_init=0.02, ds_min=1e-3,
               ds_max=0.1, rk_tol=1e-4, fresnel=True, verbose=False,
@@ -1419,8 +1467,8 @@ class WarpTracer:
             surface_model = "coated" if fresnel else "custom"
         if surface_model not in ("fresnel", "custom", "coated"):
             raise ValueError(
-                f"surface_model must be 'fresnel', 'custom', or 'coated', "
-                f"got '{surface_model}'")
+                "surface_model must be 'fresnel', 'custom', or 'coated', "
+                "got '{}'".format(surface_model))
         model_map = {"fresnel": 0, "custom": 1, "coated": 2}
         surface_model_flag = model_map[surface_model]
 
