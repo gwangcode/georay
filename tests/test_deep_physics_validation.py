@@ -33,10 +33,7 @@ from georay import AdvancedRayTracerPBRTGPU, generate_rays
 # ==============================================================================
 
 def bk7_sellmeier(wl_nm: float) -> float:
-    """N-BK7 玻璃在波长 λ (nm) 下的折射率（Schott 官方 Sellmeier 系数）。
-
-    参考：Schott Glass catalog, N-BK7 datasheet
-    """
+    """N-BK7 玻璃在波长 λ (nm) 下的折射率（Schott 官方 Sellmeier 系数）。"""
     wl_um2 = (wl_nm * 1e-3) ** 2
     B1, B2, B3 = 1.03961212, 0.231792344, 1.01046945
     C1, C2, C3 = 0.00600069867, 0.0200179144, 103.560653
@@ -106,12 +103,10 @@ def fresnel_ts_tp(n1, n2, theta_i):
 def test_circular_to_elliptical_polarization():
     """
     圆偏振 (S0=1, S1=0, S2=0, S3=1) 经 Fresnel 反射后
-    变成椭圆偏振，S1 和 S3 由 r_s, r_p 决定：
+    变成椭圆偏振：
 
         S1_out = (R_s − R_p) / (R_s + R_p)
         S3_out = 2 · r_s · r_p / (R_s + R_p)
-
-    这是 Jones 矩阵 diag(r_s, r_p) 作用于圆偏振输入的直接后果。
     """
     device = torch.device("cpu")
     n1, n2 = 1.0, 1.5
@@ -146,24 +141,23 @@ def test_circular_to_elliptical_polarization():
     S1_expected = (R_s - R_p) / (R_s + R_p)
     S3_expected = 2.0 * r_s * r_p / (R_s + R_p)
 
-    # 反射发生在 step 1
     S1_out = out["stokes"][0, 1, 1].item()
     S3_out = out["stokes"][0, 1, 3].item()
 
-    print(f"\n[Test 1] Circular → Elliptical")
-    print(f"  θi = 30°, n1 = {n1}, n2 = {n2}")
-    print(f"  r_s = {r_s:.6f}, r_p = {r_p:.6f}")
-    print(f"  Expected: S1 = {S1_expected:.6f}, S3 = {S3_expected:.6f}")
-    print(f"  Got     : S1 = {S1_out:.6f}, S3 = {S3_out:.6f}")
+    print("\n[Test 1] Circular -> Elliptical")
+    print("  theta_i = 30 deg, n1 = {}, n2 = {}".format(n1, n2))
+    print("  r_s = {:.6f}, r_p = {:.6f}".format(r_s, r_p))
+    print("  Expected: S1 = {:.6f}, S3 = {:.6f}".format(S1_expected, S3_expected))
+    print("  Got     : S1 = {:.6f}, S3 = {:.6f}".format(S1_out, S3_out))
 
     assert abs(S1_out - S1_expected) < 1e-4, \
-        f"S1 mismatch: got {S1_out}, expected {S1_expected}"
+        "S1 mismatch: got {}, expected {}".format(S1_out, S1_expected)
     assert abs(S3_out - S3_expected) < 1e-4, \
-        f"S3 mismatch: got {S3_out}, expected {S3_expected}"
+        "S3 mismatch: got {}, expected {}".format(S3_out, S3_expected)
 
     # DoP 必须保持为 1（无退偏振）
     dop = math.sqrt(S1_out ** 2 + S3_out ** 2)
-    assert abs(dop - 1.0) < 1e-4, f"DoP must remain 1, got {dop}"
+    assert abs(dop - 1.0) < 1e-4, "DoP must remain 1, got {}".format(dop)
 
 
 # ==============================================================================
@@ -176,8 +170,6 @@ def test_fresnel_transmission_coefficients():
 
         S1_out = (t_s² − t_p²) / (t_s² + t_p²)
         S2_out = 2 · t_s · t_p / (t_s² + t_p²)
-
-    这是 Jones 矩阵 diag(t_s, t_p) 作用于 45° 线偏振输入的直接后果。
     """
     device = torch.device("cpu")
     n1, n2 = 1.0, 1.5
@@ -209,20 +201,20 @@ def test_fresnel_transmission_coefficients():
     S1_out = out["stokes"][0, 1, 1].item()
     S2_out = out["stokes"][0, 1, 2].item()
 
-    print(f"\n[Test 2] Fresnel Transmission Coefficients")
-    print(f"  θi = 45°, n1 = {n1}, n2 = {n2}")
-    print(f"  t_s = {t_s:.6f}, t_p = {t_p:.6f}")
-    print(f"  Expected: S1 = {S1_expected:.6f}, S2 = {S2_expected:.6f}")
-    print(f"  Got     : S1 = {S1_out:.6f}, S2 = {S2_out:.6f}")
+    print("\n[Test 2] Fresnel Transmission Coefficients")
+    print("  theta_i = 45 deg, n1 = {}, n2 = {}".format(n1, n2))
+    print("  t_s = {:.6f}, t_p = {:.6f}".format(t_s, t_p))
+    print("  Expected: S1 = {:.6f}, S2 = {:.6f}".format(S1_expected, S2_expected))
+    print("  Got     : S1 = {:.6f}, S2 = {:.6f}".format(S1_out, S2_out))
 
     assert abs(S1_out - S1_expected) < 1e-4, \
-        f"S1 mismatch: got {S1_out}, expected {S1_expected}"
+        "S1 mismatch: got {}, expected {}".format(S1_out, S1_expected)
     assert abs(S2_out - S2_expected) < 1e-4, \
-        f"S2 mismatch: got {S2_out}, expected {S2_expected}"
+        "S2 mismatch: got {}, expected {}".format(S2_out, S2_expected)
 
     # 归一化检查
     assert abs(S1_out ** 2 + S2_out ** 2 - 1.0) < 1e-4, \
-        f"S1² + S2² must = 1, got {S1_out ** 2 + S2_out ** 2}"
+        "S1^2 + S2^2 must = 1, got {}".format(S1_out ** 2 + S2_out ** 2)
 
 
 # ==============================================================================
@@ -231,15 +223,8 @@ def test_fresnel_transmission_coefficients():
 
 def test_polarization_multiple_bounce_flip():
     """
-    45° 线偏振在正入射反射下，每次反射偏振翻转一次：
-
-        Jones: (1/√2, 1/√2)  → 反射 → (r_s/√2, r_p/√2) = (r_s/√2, −r_s/√2)
-                            → Stokes S2 = −1（变成 −45°）
-
-    物理原因：正入射时 r_p = −r_s，符号差导致偏振轴旋转 90°。
-    经过两次反射后回到原状态。
-
-    这是 Stokes 参考系旋转的直接验证。
+    45° 线偏振在正入射反射下，每次反射偏振翻转一次。
+    正入射时 r_p = −r_s，符号差导致 S2 翻转。
     """
     device = torch.device("cpu")
     verts, faces = make_two_parallel_mirrors(device, hs=5.0, z0=0.0, z1=1.0)
@@ -255,28 +240,27 @@ def test_polarization_multiple_bounce_flip():
         polarization=45.0, device=device)
 
     tracer = AdvancedRayTracerPBRTGPU(verts, faces, fm, materials, device)
-    # custom + reflectivity=1 → 每次命中都反射
     out = tracer.trace(rays, max_steps=3, surface_model="custom")
 
-    S2_init = out["stokes"][0, 0, 2].item()   # 初始 45° → S2 = +1
-    S2_1st = out["stokes"][0, 1, 2].item()    # 1 次反射后 → S2 翻转
-    S2_2nd = out["stokes"][0, 2, 2].item()    # 2 次反射后 → S2 恢复
-    S2_3rd = out["stokes"][0, 3, 2].item()    # 3 次反射后 → S2 再翻转
+    S2_init = out["stokes"][0, 0, 2].item()
+    S2_1st = out["stokes"][0, 1, 2].item()
+    S2_2nd = out["stokes"][0, 2, 2].item()
+    S2_3rd = out["stokes"][0, 3, 2].item()
 
-    print(f"\n[Test 3] Polarization Flip on Multiple Bounces")
-    print(f"  Initial S2     = {S2_init:+.6f}  (+45°)")
-    print(f"  After 1 bounce = {S2_1st:+.6f}  (flip → −45°)")
-    print(f"  After 2 bounce = {S2_2nd:+.6f}  (recover → +45°)")
-    print(f"  After 3 bounce = {S2_3rd:+.6f}  (flip → −45°)")
+    print("\n[Test 3] Polarization Flip on Multiple Bounces")
+    print("  Initial S2     = {:+.6f}  (+45 deg)".format(S2_init))
+    print("  After 1 bounce = {:+.6f}  (flip to -45 deg)".format(S2_1st))
+    print("  After 2 bounce = {:+.6f}  (recover to +45 deg)".format(S2_2nd))
+    print("  After 3 bounce = {:+.6f}  (flip to -45 deg)".format(S2_3rd))
 
     assert abs(S2_init - 1.0) < 1e-5, \
-        f"Initial S2 must be +1 (45°), got {S2_init}"
+        "Initial S2 must be +1 (45 deg), got {}".format(S2_init)
     assert abs(S2_1st + 1.0) < 1e-5, \
-        f"After 1 bounce S2 must be −1 (flip), got {S2_1st}"
+        "After 1 bounce S2 must be -1 (flip), got {}".format(S2_1st)
     assert abs(S2_2nd - 1.0) < 1e-5, \
-        f"After 2 bounces S2 must be +1 (recover), got {S2_2nd}"
+        "After 2 bounces S2 must be +1 (recover), got {}".format(S2_2nd)
     assert abs(S2_3rd + 1.0) < 1e-5, \
-        f"After 3 bounces S2 must be −1 (flip again), got {S2_3rd}"
+        "After 3 bounces S2 must be -1 (flip again), got {}".format(S2_3rd)
 
 
 # ==============================================================================
@@ -286,22 +270,18 @@ def test_polarization_multiple_bounce_flip():
 def test_bk7_d_line_reference_index():
     """
     N-BK7 玻璃在 d-line (587.6 nm) 的折射率参考值：n = 1.51680。
-
     参考：Schott Glass catalog (N-BK7 datasheet)
-
-    验证 tracer 的波长插值返回与已发表参考值一致的结果。
     """
     device = torch.device("cpu")
     wl_d = 587.6
     n_ref = 1.51680
     n_sellmeier = bk7_sellmeier(wl_d)
 
-    print(f"\n[Test 4] BK7 d-line Reference Index")
-    print(f"  λ = {wl_d} nm")
-    print(f"  Schott catalog reference: n = {n_ref:.5f}")
-    print(f"  Sellmeier formula       : n = {n_sellmeier:.5f}")
+    print("\n[Test 4] BK7 d-line Reference Index")
+    print("  lambda = {} nm".format(wl_d))
+    print("  Schott catalog reference: n = {:.5f}".format(n_ref))
+    print("  Sellmeier formula       : n = {:.5f}".format(n_sellmeier))
 
-    # 用 3 个波长点建立 LUT，其中包含 587.6nm 精确点
     n_spec = {
         "wavelengths_nm": [550.0, 587.6, 650.0],
         "values": [bk7_sellmeier(550.0), bk7_sellmeier(587.6), bk7_sellmeier(650.0)],
@@ -325,12 +305,10 @@ def test_bk7_d_line_reference_index():
     out = tracer.trace(rays, max_steps=3, surface_model="custom")
 
     n_measured = out["n2"][0, 1, 0].item()
+    print("  Tracer output           : n = {:.5f}".format(n_measured))
 
-    print(f"  Tracer output           : n = {n_measured:.5f}")
-
-    # 与 Schott 参考值对比
     assert abs(n_measured - n_ref) < 1e-4, \
-        f"tracer n(587.6nm) = {n_measured:.5f}, expected {n_ref:.5f} (Schott)"
+        "tracer n(587.6nm) = {:.5f}, expected {:.5f} (Schott)".format(n_measured, n_ref)
 
 
 # ==============================================================================
@@ -339,23 +317,13 @@ def test_bk7_d_line_reference_index():
 
 def test_sellmeier_dispersion_curve():
     """
-    多个标准谱线下，tracer 的 n(λ) 与 BK7 Sellmeier 公式对比：
-
-        F-line  (486.1 nm): n = 1.52238
-        d-line  (587.6 nm): n = 1.51680
-        C-line  (656.3 nm): n = 1.51432
-
-    验证波长相关折射率的物理正确性。
+    多个标准谱线下，tracer 的 n(λ) 与 BK7 Sellmeier 公式对比。
     """
     device = torch.device("cpu")
 
-    # 用密集网格构建 n(λ) LUT
     wl_grid = np.arange(400.0, 700.1, 20.0).tolist()
     n_values = [bk7_sellmeier(w) for w in wl_grid]
-    n_spec = {
-        "wavelengths_nm": wl_grid,
-        "values": n_values,
-    }
+    n_spec = {"wavelengths_nm": wl_grid, "values": n_values}
     materials = {
         0: {"n": 1.0, "reflectivity": 1.0, "diffuse": 0.0, "absorptivity": 0.0},
         1: {"n": n_spec, "reflectivity": 1.0, "diffuse": 0.0, "absorptivity": 0.0},
@@ -365,9 +333,11 @@ def test_sellmeier_dispersion_curve():
     fm = torch.tensor([[1, 0], [1, 0]], dtype=torch.long, device=device)
     tracer = AdvancedRayTracerPBRTGPU(verts, faces, fm, materials, device)
 
-    print(f"\n[Test 5] Sellmeier Dispersion Curve")
-    print(f"  {'λ (nm)':<12} {'n (Sellmeier)':<18} {'n (tracer)':<18} {'Δ':<12}")
-    print(f"  " + "-" * 60)
+    print("\n[Test 5] Sellmeier Dispersion Curve")
+    header = "  {:>8s} {:>18s} {:>18s} {:>12s}".format(
+        "lambda", "n (Sellmeier)", "n (tracer)", "delta")
+    print(header)
+    print("  " + "-" * 60)
 
     max_err = 0.0
     for wl, n_ref in sorted(BK7_REFERENCE.items()):
@@ -383,15 +353,16 @@ def test_sellmeier_dispersion_curve():
 
         err = abs(n_meas - n_ref)
         max_err = max(max_err, err)
-        print(f"  {wl:<12.1f} {n_ref:<18.5f} {n_meas:<18.5f} {err:<12.2e}")
+        print("  {:>8.1f} {:>18.5f} {:>18.5f} {:>12.2e}".format(
+            wl, n_ref, n_meas, err))
 
-    print(f"  " + "-" * 60)
-    print(f"  Max error: {max_err:.2e}")
+    print("  " + "-" * 60)
+    print("  Max error: {:.2e}".format(max_err))
 
     assert max_err < 1e-4, \
-        f"Sellmeier curve mismatch: max error = {max_err:.6e}"
+        "Sellmeier curve mismatch: max error = {:.6e}".format(max_err)
 
-    # ---- 色散趋势检查（n 应随 λ 增大而减小）----
+    # 色散趋势
     wls = [450.0, 550.0, 650.0]
     ns = []
     for wl in wls:
@@ -404,10 +375,11 @@ def test_sellmeier_dispersion_curve():
         out = tracer.trace(rays, max_steps=3, surface_model="custom")
         ns.append(out["n2"][0, 1, 0].item())
 
-    print(f"\n  Dispersion trend: n(450)={ns[0]:.5f}, "
-          f"n(550)={ns[1]:.5f}, n(650)={ns[2]:.5f}")
+    print("\n  Dispersion trend: n(450)={:.5f}, n(550)={:.5f}, n(650)={:.5f}".format(
+        ns[0], ns[1], ns[2]))
     assert ns[0] > ns[1] > ns[2], \
-        f"Normal dispersion violated: n(450)={ns[0]}, n(550)={ns[1]}, n(650)={ns[2]}"
+        "Normal dispersion violated: n(450)={}, n(550)={}, n(650)={}".format(
+            ns[0], ns[1], ns[2])
 
 
 # ==============================================================================
@@ -417,19 +389,15 @@ def test_sellmeier_dispersion_curve():
 def test_brewster_angle_polarization_purity():
     """
     Brewster 角 θ_B = atan(n₂/n₁) 处，R_p = 0。
-
-    对于非偏振输入：
-      - 反射光只能是 s 偏振
-      - 反射光的 Stokes S1 应严格等于 +1
-
-    这是 Brewster 角的经典性质：反射光完全线偏振（垂直于入射面）。
+    对于非偏振输入，反射光只能是 s 偏振，S1 应严格等于 +1。
     """
     device = torch.device("cpu")
     n1, n2 = 1.0, 1.5
     theta_B = math.atan(n2 / n1)
 
-    print(f"\n[Test 6] Brewster Angle Polarization Purity")
-    print(f"  θ_B = atan({n2}/{n1}) = {math.degrees(theta_B):.4f}°")
+    print("\n[Test 6] Brewster Angle Polarization Purity")
+    print("  theta_B = atan({}/{}) = {:.4f} deg".format(
+        n2, n1, math.degrees(theta_B)))
 
     verts, faces = make_flat_interface(device)
     fm = torch.tensor([[1, 0], [1, 0]], dtype=torch.long, device=device)
@@ -443,33 +411,29 @@ def test_brewster_angle_polarization_purity():
         source_type="grid", num_rays=2000,
         origin=(0.0, 0.0, -1.0), direction=direction,
         bounds=(-0.5, 0.5, -0.5, 0.5),
-        polarization="random", device=device)   # 非偏振输入
+        polarization="random", device=device)
 
     tracer = AdvancedRayTracerPBRTGPU(verts, faces, fm, materials, device)
     out = tracer.trace(rays, max_steps=3, surface_model="fresnel")
 
-    # 过滤出发生反射的光线
-    # 反射的光线 transmissivity 低（大部分能量反射）
     T = out["transmissivity"][:, 1, 0]
     reflected_mask = T < 0.5
     n_reflected = reflected_mask.sum().item()
 
-    print(f"  Total rays       : {rays['origins'].shape[0]}")
-    print(f"  Reflected rays   : {n_reflected}")
+    print("  Total rays       : {}".format(rays["origins"].shape[0]))
+    print("  Reflected rays   : {}".format(n_reflected))
 
     assert n_reflected > 20, \
-        f"Too few reflected rays for statistics: {n_reflected}"
+        "Too few reflected rays for statistics: {}".format(n_reflected)
 
-    # 反射光线的 S1 应该 ≈ 1（纯 s 偏振）
     S1_reflected = out["stokes"][reflected_mask, 1, 1]
     S1_min = S1_reflected.min().item()
     S1_mean = S1_reflected.mean().item()
 
-    print(f"  S1 of reflected rays: min={S1_min:.6f}, mean={S1_mean:.6f}")
+    print("  S1 of reflected rays: min={:.6f}, mean={:.6f}".format(S1_min, S1_mean))
 
-    # 允许小量数值偏差（Brewster 角附近 R_p 数值上 ≈ 1e-8）
     assert S1_min > 0.99, \
-        f"Reflected light must be s-polarized (S1=1), got min S1={S1_min}"
+        "Reflected light must be s-polarized (S1=1), got min S1={}".format(S1_min)
 
 
 # ==============================================================================
@@ -484,14 +448,12 @@ def test_dispersion_polarization_energy_combined():
       - 每个波长下 R + T + A = 1（能量守恒）
       - 透射偏振 S1 与解析 t_s(λ), t_p(λ) 一致
       - 不同波长的结果因色散而不同
-
-    这个测试把三个独立物理效应（色散、偏振、能量守恒）耦合在一起。
     """
     device = torch.device("cpu")
     n1 = 1.0
     theta_i = math.radians(45.0)
 
-    # 用 BK7 的 Sellmeier 建立 n(λ) LUT
+    # BK7 Sellmeier n(λ) LUT
     wl_grid = [450.0, 500.0, 550.0, 587.6, 600.0, 650.0, 700.0]
     n_values = [bk7_sellmeier(w) for w in wl_grid]
     n_spec = {"wavelengths_nm": wl_grid, "values": n_values}
@@ -507,6 +469,67 @@ def test_dispersion_polarization_energy_combined():
 
     direction = (math.sin(theta_i), 0.0, math.cos(theta_i))
 
-    print(f"\n[Test 7] Dispersion + Polarization + Energy Combined")
-    print(f"  θi = 45°, 45° linear polarization input")
-    print(f"  {'λ (nm)':<10} {'n2':<12} {'S1 (expected)':<16} {'S1 (tracer)':<
+    print("\n[Test 7] Dispersion + Polarization + Energy Combined")
+    print("  theta_i = 45 deg, 45-degree linear polarization input")
+    header = "  {:>8s} {:>10s} {:>16s} {:>16s} {:>12s} {:>14s}".format(
+        "lambda", "n2", "S1 (expected)", "S1 (tracer)", "|R+T+A-1|", "S2 (tracer)")
+    print(header)
+    print("  " + "-" * 84)
+
+    test_wls = [486.1, 587.6, 656.3]
+
+    for wl in test_wls:
+        # 解析 n2
+        n2 = bk7_sellmeier(wl)
+
+        # 解析预期 S1（透射后偏振）
+        t_s, t_p = fresnel_ts_tp(n1, n2, theta_i)
+        denom = t_s ** 2 + t_p ** 2
+        S1_expected = (t_s ** 2 - t_p ** 2) / denom
+
+        # Tracer 运行
+        rays = generate_rays(
+            source_type="grid", num_rays=64,
+            origin=(0.0, 0.0, -1.0), direction=direction,
+            bounds=(-0.3, 0.3, -0.3, 0.3),
+            polarization=45.0, device=device,
+            wavelength_nm=wl)
+
+        out = tracer.trace(rays, max_steps=3, surface_model="fresnel")
+
+        # 透射光线的 S1、S2
+        T = out["transmissivity"][:, 1, 0]
+        transmitted_mask = T > 0.5
+        S1_meas = out["stokes"][transmitted_mask, 1, 1].mean().item()
+        S2_meas = out["stokes"][transmitted_mask, 1, 2].mean().item()
+
+        # 能量守恒
+        R = out["reflectivity"][:, 1, 0]
+        Tt = out["transmissivity"][:, 1, 0]
+        A = out["absorptivity"][:, 1, 0]
+        total = R + Tt + A
+        dev = (total - 1.0).abs().max().item()
+
+        print("  {:>8.1f} {:>10.5f} {:>16.6f} {:>16.6f} {:>12.2e} {:>14.6f}".format(
+            wl, n2, S1_expected, S1_meas, dev, S2_meas))
+
+        # 断言
+        assert abs(S1_meas - S1_expected) < 1e-3, \
+            "lambda={}nm: S1 mismatch, got {:.6f}, expected {:.6f}".format(
+                wl, S1_meas, S1_expected)
+        assert dev < 1e-4, \
+            "lambda={}nm: R+T+A-1 = {:.2e} > 1e-4".format(wl, dev)
+        assert out["energy_conserved"], \
+            "lambda={}nm: energy_conserved flag is False".format(wl)
+
+    # ---- 色散导致的偏振差 ----
+    print("\n  -> S1 changes with wavelength due to dispersion (see table above)")
+
+
+# ==============================================================================
+# Entry point
+# ==============================================================================
+
+if __name__ == "__main__":
+    import sys
+    sys.exit(pytest.main([__file__, "-v", "-s"]))
