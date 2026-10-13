@@ -251,6 +251,7 @@ Environment: Google Colab, Tesla T4 GPU, 5,132-face scene, 20-step trace.
 | 4,096 | 8,041 | 5.5 | **1454×** |
 | 16,384 | 11,690 | 6.3 | **1856×** |
 | 65,536 | 15,184 | 16.3 | **930×** |
+
 **Why so fast?** WarpTracer compiles the entire trace loop (max_steps iterations plus per-step BVH traversal, surface interaction, and GRIN RK4 stepping) into a single CUDA kernel. There is no Python-level loop, no .any() / .item() CPU-GPU synchronization, and no per-step kernel launch overhead.
 
 ## Feature Matrix
