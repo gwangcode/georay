@@ -12,25 +12,20 @@
 
 属性 LUT（n / reflectivity / diffuse / absorptivity 都支持）：
     * kind=0: 标量常量
-    * kind=1: 1D 波长 LUT   n(λ)
-    * kind=2: 2D 波长×角度 LUT   n(λ, cosθ)
-    * kind=3: 3D GRIN LUT   n(x, y, z)
-    * kind=4: 4D GRIN+波长 LUT   n(x, y, z, λ)
+    * kind=1: 1D 波长 LUT
+    * kind=2: 2D 波长×角度 LUT
+    * kind=3: 3D GRIN LUT
+    * kind=4: 4D GRIN+波长 LUT
 
 GRIN 场：
     * parabolic 内置 RK4
     * callable (@wp.func) 编译期内联
     * 3D dict-grid  三线性插值 + 解析梯度
     * 4D dict-grid  四线性插值 + 中心差分梯度
-
-限制：
-    * 光线不能从介质内部出发
-    * 不支持复数折射率
 """
 from __future__ import annotations
 
 import math
-from typing import Callable, Optional
 import numpy as np
 import torch
 import warp as wp
@@ -94,7 +89,7 @@ def rotate_stokes_to_new_s(
 
 
 # ==============================================================================
-# LUT 插值函数
+# LUT 插值函数（无嵌套函数，无 for 内 return）
 # ==============================================================================
 
 @wp.func
@@ -105,7 +100,7 @@ def interp_1d_full(
     offset: wp.int32,
     K: wp.int32,
 ):
-    """1D 线性插值：grid[offset..offset+K-1] → values[offset..offset+K-1]。"""
+    """1D 线性插值。用固定上限循环 + flag 避免 for 内 return。"""
     if K <= 0:
         return wp.float32(0.0)
     if K == 1:
@@ -119,18 +114,24 @@ def interp_1d_full(
     if x >= xK_g:
         return values[offset + K - 1]
 
-    # 线性查找
-    for k in range(K - 1):
-        x1 = grid[offset + k + 1]
-        if x1 >= x:
-            x0 = grid[offset + k]
-            y0 = values[offset + k]
-            y1 = values[offset + k + 1]
-            if x1 - x0 < 1e-12:
-                return y0
-            t = (x - x0) / (x1 - x0)
-            return y0 + t * (y1 - y0)
-    return values[offset + K - 1]
+    result = values[offset + K - 1]
+    found = wp.int32(0)
+
+    for k in range(256):
+        if found == 0 and k < K - 1:
+            x1 = grid[offset + k + 1]
+            if x1 >= x:
+                x0 = grid[offset + k]
+                y0 = values[offset + k]
+                y1 = values[offset + k + 1]
+                denom = x1 - x0
+                if denom < 1e-12:
+                    result = y0
+                else:
+                    t = (x - x0) / denom
+                    result = y0 + t * (y1 - y0)
+                found = wp.int32(1)
+    return result
 
 
 @wp.func
@@ -140,7 +141,7 @@ def find_interval_1d(
     offset: wp.int32,
     K: wp.int32,
 ):
-    """返回 (i, t)，使得 grid[offset+i] <= x < grid[offset+i+1], x = grid[offset+i] + t*dx。"""
+    """返回 (i, t)，grid[offset+i] <= x < grid[offset+i+1]。"""
     if K <= 1:
         return wp.int32(0), wp.float32(0.0)
 
@@ -152,15 +153,25 @@ def find_interval_1d(
     if x >= xK_g:
         return wp.int32(K - 2), wp.float32(1.0)
 
-    for k in range(K - 1):
-        x1 = grid[offset + k + 1]
-        if x1 >= x:
-            x0 = grid[offset + k]
-            if x1 - x0 < 1e-12:
-                return k, wp.float32(0.0)
-            t = (x - x0) / (x1 - x0)
-            return k, t
-    return wp.int32(K - 2), wp.float32(1.0)
+    idx_out = wp.int32(K - 2)
+    t_out = wp.float32(1.0)
+    found = wp.int32(0)
+
+    for k in range(256):
+        if found == 0 and k < K - 1:
+            x1 = grid[offset + k + 1]
+            if x1 >= x:
+                x0 = grid[offset + k]
+                denom = x1 - x0
+                if denom < 1e-12:
+                    idx_out = k
+                    t_out = wp.float32(0.0)
+                else:
+                    idx_out = k
+                    t_out = (x - x0) / denom
+                found = wp.int32(1)
+
+    return idx_out, t_out
 
 
 @wp.func
@@ -173,7 +184,7 @@ def interp_2d_full(
     y_off: wp.int32, y_size: wp.int32,
     val_off: wp.int32,
 ):
-    """2D 双线性插值。values 是行主序 [x_size * y_size]，偏移 val_off。"""
+    """2D 双线性插值。values 行主序 [x_size * y_size]。"""
     if x_size <= 1 or y_size <= 1:
         if x_size > 0 and y_size > 0:
             return values[val_off]
@@ -183,9 +194,9 @@ def interp_2d_full(
     iy, ty = find_interval_1d(y, y_grid, y_off, y_size)
 
     i00 = val_off + ix * y_size + iy
-    i01 = val_off + ix * y_size + iy + 1
+    i01 = i00 + 1
     i10 = val_off + (ix + 1) * y_size + iy
-    i11 = val_off + (ix + 1) * y_size + iy + 1
+    i11 = i10 + 1
 
     v00 = values[i00]
     v01 = values[i01]
@@ -209,7 +220,7 @@ def interp_3d_grin(
     z_off: wp.int32, z_size: wp.int32,
     val_off: wp.int32,
 ):
-    """3D 三线性插值。values 是行主序 [x_size * y_size * z_size]。"""
+    """3D 三线性插值。values 行主序 [Nx * Ny * Nz]。"""
     if x_size <= 1 or y_size <= 1 or z_size <= 1:
         if x_size > 0 and y_size > 0 and z_size > 0:
             return values[val_off]
@@ -220,18 +231,27 @@ def interp_3d_grin(
     iz, tz = find_interval_1d(z, gz, z_off, z_size)
 
     yz = y_size * z_size
+    base_ix = val_off + ix * yz
+    base_ix1 = val_off + (ix + 1) * yz
 
-    def idx(ix_, iy_, iz_):
-        return val_off + ix_ * yz + iy_ * z_size + iz_
+    i_y0_z0 = base_ix + iy * z_size + iz
+    i_y0_z1 = i_y0_z0 + 1
+    i_y1_z0 = base_ix + (iy + 1) * z_size + iz
+    i_y1_z1 = i_y1_z0 + 1
 
-    v000 = values[idx(ix, iy, iz)]
-    v001 = values[idx(ix, iy, iz + 1)]
-    v010 = values[idx(ix, iy + 1, iz)]
-    v011 = values[idx(ix, iy + 1, iz + 1)]
-    v100 = values[idx(ix + 1, iy, iz)]
-    v101 = values[idx(ix + 1, iy, iz + 1)]
-    v110 = values[idx(ix + 1, iy + 1, iz)]
-    v111 = values[idx(ix + 1, iy + 1, iz + 1)]
+    i_ix1_y0_z0 = base_ix1 + iy * z_size + iz
+    i_ix1_y0_z1 = i_ix1_y0_z0 + 1
+    i_ix1_y1_z0 = base_ix1 + (iy + 1) * z_size + iz
+    i_ix1_y1_z1 = i_ix1_y1_z0 + 1
+
+    v000 = values[i_y0_z0]
+    v001 = values[i_y0_z1]
+    v010 = values[i_y1_z0]
+    v011 = values[i_y1_z1]
+    v100 = values[i_ix1_y0_z0]
+    v101 = values[i_ix1_y0_z1]
+    v110 = values[i_ix1_y1_z0]
+    v111 = values[i_ix1_y1_z1]
 
     v00 = v000 * (1.0 - tz) + v001 * tz
     v01 = v010 * (1.0 - tz) + v011 * tz
@@ -256,10 +276,7 @@ def interp_3d_grin_and_grad(
     z_off: wp.int32, z_size: wp.int32,
     val_off: wp.int32,
 ):
-    """3D 三线性插值 + 解析梯度。
-
-    在三线性 cell 内，n 对 x/y/z 都是线性的，梯度可直接从 cell 边界的差分得出。
-    """
+    """3D 三线性插值 + 解析梯度。"""
     n_val = interp_3d_grin(x, y, z, gx, gy, gz, values,
                             x_off, x_size, y_off, y_size, z_off, z_size, val_off)
 
@@ -271,31 +288,37 @@ def interp_3d_grin_and_grad(
     iz, tz = find_interval_1d(z, gz, z_off, z_size)
 
     yz = y_size * z_size
+    base_ix = val_off + ix * yz
+    base_ix1 = val_off + (ix + 1) * yz
 
-    def idx(ix_, iy_, iz_):
-        return val_off + ix_ * yz + iy_ * z_size + iz_
+    i000 = base_ix + iy * z_size + iz
+    i001 = i000 + 1
+    i010 = base_ix + (iy + 1) * z_size + iz
+    i011 = i010 + 1
 
-    # ---- 沿 y 方向的 4 个面内插值 (用于 ∂n/∂x) ----
-    # 在 ix, iy, iz 单元上的 8 个角
-    v000 = values[idx(ix, iy, iz)]
-    v001 = values[idx(ix, iy, iz + 1)]
-    v010 = values[idx(ix, iy + 1, iz)]
-    v011 = values[idx(ix, iy + 1, iz + 1)]
-    v100 = values[idx(ix + 1, iy, iz)]
-    v101 = values[idx(ix + 1, iy, iz + 1)]
-    v110 = values[idx(ix + 1, iy + 1, iz)]
-    v111 = values[idx(ix + 1, iy + 1, iz + 1)]
+    i100 = base_ix1 + iy * z_size + iz
+    i101 = i100 + 1
+    i110 = base_ix1 + (iy + 1) * z_size + iz
+    i111 = i110 + 1
 
-    # 沿 y, z 插值 (在 ix 面)
+    v000 = values[i000]
+    v001 = values[i001]
+    v010 = values[i010]
+    v011 = values[i011]
+    v100 = values[i100]
+    v101 = values[i101]
+    v110 = values[i110]
+    v111 = values[i111]
+
+    # ∂n/∂x
     v0_lo_x = (v000 * (1.0 - tz) + v001 * tz) * (1.0 - ty) + \
               (v010 * (1.0 - tz) + v011 * tz) * ty
     v0_hi_x = (v100 * (1.0 - tz) + v101 * tz) * (1.0 - ty) + \
               (v110 * (1.0 - tz) + v111 * tz) * ty
-
     dx = gx[x_off + ix + 1] - gx[x_off + ix]
     dndx = (v0_hi_x - v0_lo_x) / (dx + 1e-12)
 
-    # ---- 沿 x, z 插值 (在 iy 面，用于 ∂n/∂y) ----
+    # ∂n/∂y
     v0_lo_y = (v000 * (1.0 - tx) + v100 * tx) * (1.0 - tz) + \
               (v001 * (1.0 - tx) + v101 * tx) * tz
     v0_hi_y = (v010 * (1.0 - tx) + v110 * tx) * (1.0 - tz) + \
@@ -303,7 +326,7 @@ def interp_3d_grin_and_grad(
     dy = gy[y_off + iy + 1] - gy[y_off + iy]
     dndy = (v0_hi_y - v0_lo_y) / (dy + 1e-12)
 
-    # ---- 沿 x, y 插值 (在 iz 面，用于 ∂n/∂z) ----
+    # ∂n/∂z
     v0_lo_z = (v000 * (1.0 - tx) + v100 * tx) * (1.0 - ty) + \
               (v010 * (1.0 - tx) + v110 * tx) * ty
     v0_hi_z = (v001 * (1.0 - tx) + v101 * tx) * (1.0 - ty) + \
@@ -328,7 +351,7 @@ def interp_4d_grin_wl(
     wl_off: wp.int32, wl_size: wp.int32,
     val_off: wp.int32,
 ):
-    """4D 四线性插值。values 是行主序 [Nx * Ny * Nz * Nw]。"""
+    """4D 四线性插值。values 行主序 [Nx * Ny * Nz * Nw]。"""
     if (x_size <= 1 or y_size <= 1 or z_size <= 1 or wl_size <= 1):
         if x_size > 0 and y_size > 0 and z_size > 0 and wl_size > 0:
             return values[val_off]
@@ -342,28 +365,48 @@ def interp_4d_grin_wl(
     yzw = y_size * z_size * wl_size
     zw = z_size * wl_size
 
-    def idx(ix_, iy_, iz_, iw_):
-        return val_off + ix_ * yzw + iy_ * zw + iz_ * wl_size + iw_
+    base_ix = val_off + ix * yzw
+    base_ix1 = val_off + (ix + 1) * yzw
 
-    # 8 个角点 (2 个 x 切片 × 4 个 yz 组合)，每个切片内对 z, wl 插值
-    # 先对 z 插值（2 次，得到 yz 平面上的 4 个值），再对 y 插值（得到 2 个 x 面），
-    # 最后对 wl 插值。
+    # (ix, iy)
+    base_00 = base_ix + iy * zw + iz * wl_size + iw
+    v_z0_w0 = values[base_00]
+    v_z0_w1 = values[base_00 + 1]
+    v_z1_w0 = values[base_00 + wl_size]
+    v_z1_w1 = values[base_00 + wl_size + 1]
+    v_z0 = v_z0_w0 * (1.0 - tw) + v_z0_w1 * tw
+    v_z1 = v_z1_w0 * (1.0 - tw) + v_z1_w1 * tw
+    v00 = v_z0 * (1.0 - tz) + v_z1 * tz
 
-    # 沿 wl 和 z 插值：在 (ix, iy) 位置，做 z-wl 双线性
-    def zw_interp(ix_, iy_):
-        v_z0_w0 = values[idx(ix_, iy_, iz, iw)]
-        v_z0_w1 = values[idx(ix_, iy_, iz, iw + 1)]
-        v_z1_w0 = values[idx(ix_, iy_, iz + 1, iw)]
-        v_z1_w1 = values[idx(ix_, iy_, iz + 1, iw + 1)]
-        v_z0 = v_z0_w0 * (1.0 - tw) + v_z0_w1 * tw
-        v_z1 = v_z1_w0 * (1.0 - tw) + v_z1_w1 * tw
-        return v_z0 * (1.0 - tz) + v_z1 * tz
+    # (ix, iy+1)
+    base_01 = base_ix + (iy + 1) * zw + iz * wl_size + iw
+    v_z0_w0 = values[base_01]
+    v_z0_w1 = values[base_01 + 1]
+    v_z1_w0 = values[base_01 + wl_size]
+    v_z1_w1 = values[base_01 + wl_size + 1]
+    v_z0 = v_z0_w0 * (1.0 - tw) + v_z0_w1 * tw
+    v_z1 = v_z1_w0 * (1.0 - tw) + v_z1_w1 * tw
+    v01 = v_z0 * (1.0 - tz) + v_z1 * tz
 
-    # 4 个 (x, y) 角
-    v00 = zw_interp(ix, iy)
-    v01 = zw_interp(ix, iy + 1)
-    v10 = zw_interp(ix + 1, iy)
-    v11 = zw_interp(ix + 1, iy + 1)
+    # (ix+1, iy)
+    base_10 = base_ix1 + iy * zw + iz * wl_size + iw
+    v_z0_w0 = values[base_10]
+    v_z0_w1 = values[base_10 + 1]
+    v_z1_w0 = values[base_10 + wl_size]
+    v_z1_w1 = values[base_10 + wl_size + 1]
+    v_z0 = v_z0_w0 * (1.0 - tw) + v_z0_w1 * tw
+    v_z1 = v_z1_w0 * (1.0 - tw) + v_z1_w1 * tw
+    v10 = v_z0 * (1.0 - tz) + v_z1 * tz
+
+    # (ix+1, iy+1)
+    base_11 = base_ix1 + (iy + 1) * zw + iz * wl_size + iw
+    v_z0_w0 = values[base_11]
+    v_z0_w1 = values[base_11 + 1]
+    v_z1_w0 = values[base_11 + wl_size]
+    v_z1_w1 = values[base_11 + wl_size + 1]
+    v_z0 = v_z0_w0 * (1.0 - tw) + v_z0_w1 * tw
+    v_z1 = v_z1_w0 * (1.0 - tw) + v_z1_w1 * tw
+    v11 = v_z0 * (1.0 - tz) + v_z1 * tz
 
     v0 = v00 * (1.0 - ty) + v01 * ty
     v1 = v10 * (1.0 - ty) + v11 * ty
@@ -384,12 +427,11 @@ def interp_4d_grin_wl_and_grad(
     wl_off: wp.int32, wl_size: wp.int32,
     val_off: wp.int32,
 ):
-    """4D 插值 + 中心差分梯度（简洁且足够精确）。"""
+    """4D 插值 + 中心差分梯度。"""
     n_val = interp_4d_grin_wl(x, y, z, wl, gx, gy, gz, gwl, values,
                                 x_off, x_size, y_off, y_size,
                                 z_off, z_size, wl_off, wl_size, val_off)
 
-    # 中心差分步长：取网格平均间距的一小部分
     h = wp.float32(1e-3)
     if x_size > 1:
         dx = (gx[x_off + x_size - 1] - gx[x_off]) / wp.float32(x_size - 1)
@@ -430,7 +472,20 @@ def interp_4d_grin_wl_and_grad(
 
 
 # ==============================================================================
-# 属性求值：统一接口
+# GRIN 抛物线（内置）
+# ==============================================================================
+
+@wp.func
+def eval_grin_parabolic(r: wp.vec3, n0: wp.float32, A: wp.float32):
+    n = n0 - A * (r[0] * r[0] + r[1] * r[1])
+    if n < 1.0:
+        n = 1.0
+    grad = wp.vec3(-2.0 * A * r[0], -2.0 * A * r[1], 0.0)
+    return n, grad
+
+
+# ==============================================================================
+# 属性求值（统一入口）
 # ==============================================================================
 
 @wp.func
@@ -440,20 +495,16 @@ def eval_property(
     wl: wp.float32,
     cos_i: wp.float32,
     pos: wp.vec3,
-    # LUT 元数据
     prop_kind: wp.array(dtype=wp.int32, ndim=2),
     prop_scalar: wp.array(dtype=wp.float32, ndim=2),
     prop_data_offset: wp.array(dtype=wp.int32, ndim=2),
     prop_data_size: wp.array(dtype=wp.int32, ndim=2),
-    # 波长 LUT 网格
     wl_grid: wp.array(dtype=wp.float32),
     wl_grid_offset: wp.array(dtype=wp.int32, ndim=2),
     wl_grid_size: wp.array(dtype=wp.int32, ndim=2),
-    # cos LUT 网格
     cos_grid: wp.array(dtype=wp.float32),
     cos_grid_offset: wp.array(dtype=wp.int32, ndim=2),
     cos_grid_size: wp.array(dtype=wp.int32, ndim=2),
-    # GRIN 3D 网格
     gx: wp.array(dtype=wp.float32),
     gx_offset: wp.array(dtype=wp.int32, ndim=2),
     gx_size: wp.array(dtype=wp.int32, ndim=2),
@@ -463,7 +514,6 @@ def eval_property(
     gz: wp.array(dtype=wp.float32),
     gz_offset: wp.array(dtype=wp.int32, ndim=2),
     gz_size: wp.array(dtype=wp.int32, ndim=2),
-    # 属性数据值（拼接）
     prop_values: wp.array(dtype=wp.float32),
 ):
     kind = prop_kind[mat_id, prop_id]
@@ -472,14 +522,12 @@ def eval_property(
         return prop_scalar[mat_id, prop_id]
 
     if kind == 1:
-        # 1D 波长
         val_off = prop_data_offset[mat_id, prop_id]
         K = prop_data_size[mat_id, prop_id]
         g_off = wl_grid_offset[mat_id, prop_id]
         return interp_1d_full(wl, wl_grid, prop_values, g_off, K)
 
     if kind == 2:
-        # 2D (波长, cos)
         val_off = prop_data_offset[mat_id, prop_id]
         w_off = wl_grid_offset[mat_id, prop_id]
         w_sz = wl_grid_size[mat_id, prop_id]
@@ -489,7 +537,6 @@ def eval_property(
                                 w_off, w_sz, c_off, c_sz, val_off)
 
     if kind == 3:
-        # 3D GRIN (x, y, z) - 只取值，不求梯度
         val_off = prop_data_offset[mat_id, prop_id]
         x_off = gx_offset[mat_id, prop_id]
         x_sz = gx_size[mat_id, prop_id]
@@ -503,7 +550,6 @@ def eval_property(
                                 val_off)
 
     if kind == 4:
-        # 4D GRIN + 波长 (x, y, z, λ)
         val_off = prop_data_offset[mat_id, prop_id]
         x_off = gx_offset[mat_id, prop_id]
         x_sz = gx_size[mat_id, prop_id]
@@ -529,7 +575,6 @@ def eval_grin_n_and_grad(
     grin_kind: wp.array(dtype=wp.int32),
     grin_n0: wp.array(dtype=wp.float32),
     grin_A: wp.array(dtype=wp.float32),
-    # LUT 元数据（同 eval_property）
     prop_data_offset: wp.array(dtype=wp.int32, ndim=2),
     prop_data_size: wp.array(dtype=wp.int32, ndim=2),
     gx: wp.array(dtype=wp.float32),
@@ -546,21 +591,12 @@ def eval_grin_n_and_grad(
     wl_grid_size: wp.array(dtype=wp.int32, ndim=2),
     prop_values: wp.array(dtype=wp.float32),
 ):
-    """返回 GRIN 场的 (n, grad_n)。GRIN 只对属性 0 (折射率 n) 有意义。"""
     gkind = grin_kind[mat_id]
 
     if gkind == 1:
-        # 抛物线解析式
-        n0 = grin_n0[mat_id]
-        A = grin_A[mat_id]
-        n = n0 - A * (pos[0] * pos[0] + pos[1] * pos[1])
-        if n < 1.0:
-            n = 1.0
-        grad = wp.vec3(-2.0 * A * pos[0], -2.0 * A * pos[1], 0.0)
-        return n, grad
+        return eval_grin_parabolic(pos, grin_n0[mat_id], grin_A[mat_id])
 
     if gkind == 3:
-        # 3D dict-grid
         val_off = prop_data_offset[mat_id, 0]
         x_off = gx_offset[mat_id, 0]
         x_sz = gx_size[mat_id, 0]
@@ -574,7 +610,6 @@ def eval_grin_n_and_grad(
                                          z_off, z_sz, val_off)
 
     if gkind == 4:
-        # 4D GRIN + 波长
         val_off = prop_data_offset[mat_id, 0]
         x_off = gx_offset[mat_id, 0]
         x_sz = gx_size[mat_id, 0]
@@ -590,7 +625,6 @@ def eval_grin_n_and_grad(
                                             z_off, z_sz, w_off, w_sz,
                                             val_off)
 
-    # 无 GRIN
     return wp.float32(1.0), wp.vec3(0.0, 0.0, 0.0)
 
 
@@ -600,27 +634,22 @@ def eval_grin_n_and_grad(
 
 @wp.kernel(enable_backward=False)
 def trace_kernel(
-    # geometry
     mesh_id: wp.uint64,
     tri_v0: wp.array(dtype=wp.vec3),
     tri_v1: wp.array(dtype=wp.vec3),
     tri_v2: wp.array(dtype=wp.vec3),
     face_materials: wp.array(dtype=wp.int32, ndim=2),
-    # property LUT metadata
-    prop_kind: wp.array(dtype=wp.int32, ndim=2),          # [num_mat, 4]
-    prop_scalar: wp.array(dtype=wp.float32, ndim=2),       # [num_mat, 4]
+    prop_kind: wp.array(dtype=wp.int32, ndim=2),
+    prop_scalar: wp.array(dtype=wp.float32, ndim=2),
     prop_data_offset: wp.array(dtype=wp.int32, ndim=2),
     prop_data_size: wp.array(dtype=wp.int32, ndim=2),
     prop_values: wp.array(dtype=wp.float32),
-    # wavelength grid
     wl_grid: wp.array(dtype=wp.float32),
     wl_grid_offset: wp.array(dtype=wp.int32, ndim=2),
     wl_grid_size: wp.array(dtype=wp.int32, ndim=2),
-    # cos grid
     cos_grid: wp.array(dtype=wp.float32),
     cos_grid_offset: wp.array(dtype=wp.int32, ndim=2),
     cos_grid_size: wp.array(dtype=wp.int32, ndim=2),
-    # GRIN 3D/4D grids
     gx: wp.array(dtype=wp.float32),
     gx_offset: wp.array(dtype=wp.int32, ndim=2),
     gx_size: wp.array(dtype=wp.int32, ndim=2),
@@ -630,16 +659,13 @@ def trace_kernel(
     gz: wp.array(dtype=wp.float32),
     gz_offset: wp.array(dtype=wp.int32, ndim=2),
     gz_size: wp.array(dtype=wp.int32, ndim=2),
-    # GRIN 抛物线参数
     grin_kind: wp.array(dtype=wp.int32),
     grin_n0: wp.array(dtype=wp.float32),
     grin_A: wp.array(dtype=wp.float32),
-    # rays in
     ray_origins: wp.array(dtype=wp.vec3),
     ray_dirs: wp.array(dtype=wp.vec3),
     ray_stokes: wp.array(dtype=wp.vec4),
     ray_wavelengths: wp.array(dtype=wp.float32),
-    # history out
     hist_pos: wp.array(dtype=wp.vec3, ndim=2),
     hist_stokes: wp.array(dtype=wp.vec4, ndim=2),
     hist_energy: wp.array(dtype=wp.float32, ndim=2),
@@ -650,7 +676,6 @@ def trace_kernel(
     hist_n1: wp.array(dtype=wp.float32, ndim=2),
     hist_n2: wp.array(dtype=wp.float32, ndim=2),
     hist_dop: wp.array(dtype=wp.float32, ndim=2),
-    # params
     max_steps: wp.int32,
     eps: wp.float32,
     far: wp.float32,
@@ -691,10 +716,8 @@ def trace_kernel(
     step = wp.int32(0)
 
     while active == 1 and step < max_steps:
-        # 求交
         q = wp.mesh_query_ray(mesh_id, origin, d, far)
 
-        # 当前介质 GRIN？
         gkind = wp.int32(0)
         if medium_id >= 0 and medium_id < num_media:
             gkind = grin_kind[medium_id]
@@ -851,13 +874,11 @@ def trace_kernel(
                     n1_id = mat_back
                     n2_id = mat_front
 
-                # ---- n1 (折射率) ----
-                # 如果前介质是 GRIN，用局域值
+                # ---- n1 ----
                 gkind_1 = wp.int32(0)
                 if n1_id >= 0 and n1_id < num_media:
                     gkind_1 = grin_kind[n1_id]
                 if gkind_1 > 0:
-                    # 用入射点位置求局部 n
                     n1, _ = eval_grin_n_and_grad(
                         n1_id, origin, wl, grin_kind, grin_n0, grin_A,
                         prop_data_offset, prop_data_size,
@@ -908,7 +929,6 @@ def trace_kernel(
                 if n2 < 1.0:
                     n2 = 1.0
 
-                # ---- reflectivity / diffuse / absorptivity (都走 LUT) ----
                 custom_refl = eval_property(
                     n2_id, 1, wl, cos_i, origin,
                     prop_kind, prop_scalar,
@@ -1087,7 +1107,7 @@ def trace_kernel(
 
 
 # ==============================================================================
-# LUT 构建器
+# LUT Builder
 # ==============================================================================
 
 PROP_N = 0
@@ -1097,8 +1117,6 @@ PROP_A = 3
 
 
 class _LUTBuilder:
-    """累积所有材质、所有属性的 LUT 数据，最后统一打包成 Warp 数组。"""
-
     def __init__(self, num_mat):
         self.num_mat = num_mat
         self.prop_kind = np.zeros((num_mat, 4), dtype=np.int32)
@@ -1176,8 +1194,6 @@ class _LUTBuilder:
         self.values_parts.append(arr)
         self.values_len += len(arr)
 
-    # ---------- 属性：n / r / d / a 通用 ----------
-
     def add_scalar(self, mat_id, prop_id, value):
         self.prop_kind[mat_id, prop_id] = 0
         self.prop_scalar[mat_id, prop_id] = float(value)
@@ -1186,21 +1202,16 @@ class _LUTBuilder:
         self.prop_kind[mat_id, prop_id] = 1
         self._add_wl_grid(mat_id, prop_id, wl_nodes)
         self._add_values(mat_id, prop_id, values)
-        # 默认标量用中位值
-        self.prop_scalar[mat_id, prop_id] = float(np.asarray(values).flatten()[len(values)//2])
+        vals_arr = np.asarray(values).flatten()
+        self.prop_scalar[mat_id, prop_id] = float(vals_arr[len(vals_arr) // 2])
 
     def add_2d_lut(self, mat_id, prop_id, wl_nodes, cos_nodes, values_2d):
-        """values_2d: [len(wl_nodes), len(cos_nodes)]，行主序。"""
         self.prop_kind[mat_id, prop_id] = 2
         self._add_wl_grid(mat_id, prop_id, wl_nodes)
         self._add_cos_grid(mat_id, prop_id, cos_nodes)
-        # Warp 内核里的 2D 索引是 [ix * y_size + iy]
-        # 与 numpy 的 [ix, iy] 行主序一致
-        arr = np.asarray(values_2d, dtype=np.float32)
-        self._add_values(mat_id, prop_id, arr)
+        self._add_values(mat_id, prop_id, values_2d)
 
     def add_grin_3d(self, mat_id, x_nodes, y_nodes, z_nodes, values_3d):
-        """values_3d: [len(x_nodes), len(y_nodes), len(z_nodes)]，行主序。"""
         self.prop_kind[mat_id, PROP_N] = 3
         self._add_gx(mat_id, PROP_N, x_nodes)
         self._add_gy(mat_id, PROP_N, y_nodes)
@@ -1210,7 +1221,6 @@ class _LUTBuilder:
         self.prop_scalar[mat_id, PROP_N] = float(arr.flatten()[0])
 
     def add_grin_4d(self, mat_id, x_nodes, y_nodes, z_nodes, wl_nodes, values_4d):
-        """values_4d: [Nx, Ny, Nz, Nw]，行主序。"""
         self.prop_kind[mat_id, PROP_N] = 4
         self._add_gx(mat_id, PROP_N, x_nodes)
         self._add_gy(mat_id, PROP_N, y_nodes)
@@ -1219,8 +1229,6 @@ class _LUTBuilder:
         arr = np.asarray(values_4d, dtype=np.float32)
         self._add_values(mat_id, PROP_N, arr)
         self.prop_scalar[mat_id, PROP_N] = float(arr.flatten()[0])
-
-    # ---------- 打包 ----------
 
     def build(self, device):
         def _cat(parts, dtype=np.float32):
@@ -1257,24 +1265,7 @@ class _LUTBuilder:
 # ==============================================================================
 
 class WarpTracer:
-    """全 Warp 内核 tracer。
-
-    支持的材质配置：
-        n:
-            - 标量 float
-            - {"wavelengths_nm": [...], "values": [...]}                1D
-            - {"wavelengths_nm": [...], "cos_theta": [...], "values": [[...]]}  2D
-        grin_field:
-            - {"type": "parabolic", "n0": ..., "A": ...}
-            - {"type": "grid", "x": [...], "y": [...], "z": [...], "values": [[[...]]]}
-            - {"type": "grid_4d", "x": [...], "y": [...], "z": [...],
-               "wavelengths_nm": [...], "values": [[[[...]]]]}
-            - {"type": "callable"}  配合 grin_callable 参数使用
-        reflectivity / diffuse / absorptivity:
-            - 标量 float
-            - {"wavelengths_nm": [...], "values": [...]}                1D
-            - {"wavelengths_nm": [...], "cos_theta": [...], "values": [[...]]}  2D
-    """
+    """全 Warp 内核 tracer。"""
 
     def __init__(self, vertices, faces, face_materials, materials_cfg, device,
                  grin_callable=None):
@@ -1284,7 +1275,6 @@ class WarpTracer:
 
         wp.init()
 
-        # ---- 网格 ----
         verts_np = vertices.detach().cpu().numpy().astype(np.float32)
         faces_np = faces.detach().cpu().numpy().astype(np.int32).flatten()
 
@@ -1307,27 +1297,21 @@ class WarpTracer:
         self.face_materials = wp.array(fm_np, dtype=wp.int32, ndim=2,
                                          device=self.warp_device)
 
-        # ---- LUT 构建 ----
         max_mat = max(materials_cfg.keys()) + 1
         self.num_media = max_mat
         lut = _LUTBuilder(max_mat)
 
-        # GRIN 抛物线参数
         grin_kind_arr = np.zeros(max_mat, dtype=np.int32)
         grin_n0_arr = np.ones(max_mat, dtype=np.float32)
         grin_A_arr = np.zeros(max_mat, dtype=np.float32)
 
         for k, cfg in materials_cfg.items():
-            # ---------- n ----------
             n_cfg = cfg.get("n", 1.0)
             self._add_property(lut, k, PROP_N, n_cfg)
-
-            # ---------- reflectivity / diffuse / absorptivity ----------
             self._add_property(lut, k, PROP_R, cfg.get("reflectivity", 0.0))
             self._add_property(lut, k, PROP_D, cfg.get("diffuse", 0.0))
             self._add_property(lut, k, PROP_A, cfg.get("absorptivity", 0.0))
 
-            # ---------- GRIN ----------
             gf = cfg.get("grin_field", None)
             if gf is not None:
                 if isinstance(gf, dict):
@@ -1338,27 +1322,24 @@ class WarpTracer:
                         A = float(gf.get("A", 0.0))
                         grin_n0_arr[k] = n0
                         grin_A_arr[k] = A
-                        # 抛物线的 n 也填充到 prop_scalar 作为 fallback
                         lut.prop_scalar[k, PROP_N] = n0
                     elif gtype == "grid":
-                        # GRIN 3D dict-grid
                         x = np.asarray(gf["x"], dtype=np.float32)
                         y = np.asarray(gf["y"], dtype=np.float32)
                         z = np.asarray(gf["z"], dtype=np.float32)
                         values = np.asarray(gf["values"], dtype=np.float32)
                         assert values.shape == (len(x), len(y), len(z)), \
-                            f"GRIN grid values shape {values.shape} != ({len(x)}, {len(y)}, {len(z)})"
+                            f"GRIN grid shape {values.shape} != ({len(x)}, {len(y)}, {len(z)})"
                         lut.add_grin_3d(k, x, y, z, values)
                         grin_kind_arr[k] = 3
                     elif gtype == "grid_4d":
-                        # GRIN 4D dict-grid
                         x = np.asarray(gf["x"], dtype=np.float32)
                         y = np.asarray(gf["y"], dtype=np.float32)
                         z = np.asarray(gf["z"], dtype=np.float32)
                         wl = np.asarray(gf["wavelengths_nm"], dtype=np.float32)
                         values = np.asarray(gf["values"], dtype=np.float32)
                         assert values.shape == (len(x), len(y), len(z), len(wl)), \
-                            f"GRIN 4D values shape {values.shape}"
+                            f"GRIN 4D shape {values.shape}"
                         lut.add_grin_4d(k, x, y, z, wl, values)
                         grin_kind_arr[k] = 4
                     elif gtype == "callable":
@@ -1366,14 +1347,12 @@ class WarpTracer:
                             raise ValueError(
                                 f"Material {k} uses grin_field={{'type': 'callable'}} "
                                 f"but grin_callable is None")
-                        # callable 用单独的预编译变体（暂不支持在同一个内核里）
                         grin_kind_arr[k] = 2
                     else:
                         raise NotImplementedError(f"Unsupported grin type: {gtype}")
                 else:
-                    raise NotImplementedError(f"grin_field must be dict, got {type(gf)}")
+                    raise NotImplementedError(f"grin_field must be dict")
 
-        # 上传 LUT
         lut_arrays = lut.build(self.warp_device)
         self.prop_kind = lut_arrays["prop_kind"]
         self.prop_scalar = lut_arrays["prop_scalar"]
@@ -1402,7 +1381,6 @@ class WarpTracer:
 
     @staticmethod
     def _add_property(lut, mat_id, prop_id, cfg):
-        """根据 cfg 的类型，往 LUT 里添加一个属性。"""
         if isinstance(cfg, (int, float)):
             lut.add_scalar(mat_id, prop_id, float(cfg))
             return
@@ -1411,13 +1389,11 @@ class WarpTracer:
             raise NotImplementedError(
                 f"Property config must be scalar or dict, got {type(cfg)}")
 
-        # 波长 + 角度 2D LUT
         if "wavelengths_nm" in cfg and "cos_theta" in cfg and "values" in cfg:
             lut.add_2d_lut(mat_id, prop_id,
                             cfg["wavelengths_nm"], cfg["cos_theta"], cfg["values"])
             return
 
-        # 波长 1D LUT
         if "wavelengths_nm" in cfg and "values" in cfg:
             lut.add_wl_lut(mat_id, prop_id, cfg["wavelengths_nm"], cfg["values"])
             return
