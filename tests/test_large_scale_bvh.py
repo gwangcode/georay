@@ -4,6 +4,7 @@ tests/test_large_scale_bvh.py
 大规模网格下 BVH 的性能与精度。
 """
 import time
+import math
 import torch
 import trimesh
 import pytest
@@ -14,7 +15,6 @@ from georay import AdvancedRayTracerPBRTGPU, generate_rays
 def make_large_mesh(device, n_spheres=100):
     """构造包含 n_spheres 个球的大规模场景。"""
     meshes = [trimesh.creation.box(extents=[20.0, 20.0, 20.0])]
-    import math
     for k in range(n_spheres):
         s = trimesh.creation.icosphere(subdivisions=1, radius=0.3)
         theta = 2 * math.pi * k / n_spheres
@@ -53,7 +53,14 @@ def test_large_mesh_build_time():
 
 
 def test_large_mesh_intersect_correctness():
-    """大规模网格下，光线仍应精确命中。"""
+    """
+    大规模网格下，光线应精确命中。
+
+    ★ 修复：
+      1. 原测试检查 active[:, 0]（永远为 True），逻辑无意义。
+         改为检查光线在 step 1 后有真实位移（position 变化）。
+      2. 原 bounds 覆盖不到环形分布的球，改为 ±6 覆盖半径 5 的整个环。
+    """
     device = torch.device("cpu")
     verts, faces, fm, _ = make_large_mesh(device, n_spheres=50)
     materials = {
@@ -61,25 +68,34 @@ def test_large_mesh_intersect_correctness():
         1: {"n": 1.5, "reflectivity": 1.0, "diffuse": 0.0, "absorptivity": 0.0},
     }
 
-    # 中心光线应命中盒子正面
+    # 从 -z 射入，覆盖整个环形球分布
     rays = generate_rays(
-        source_type="grid", num_rays=64,
+        source_type="grid", num_rays=256,
         origin=(0.0, 0.0, -15.0), direction=(0.0, 0.0, 1.0),
-        bounds=(-3.0, 3.0, -3.0, 3.0),
+        bounds=(-6.0, 6.0, -6.0, 6.0),
         polarization="s", device=device)
 
     tracer = AdvancedRayTracerPBRTGPU(verts, faces, fm, materials, device)
     out = tracer.trace(rays, max_steps=5, surface_model="custom")
 
-    # 所有光线都应命中（在 z=0 附近的球或 z=-10 的盒子面）
-    hit_fraction = out["active"][:, 0].float().mean().item()
+    # ★ 检查 pos[1] != pos[0]（光线确实移动了，说明有求交）
+    pos0 = out["positions"][:, 0, :]
+    pos1 = out["positions"][:, 1, :]
+    moved = (pos1 - pos0).norm(dim=-1) > 1e-3
+    hit_fraction = moved.float().mean().item()
 
     print("\n[Test 2] Large mesh intersect")
-    print("  Hit fraction at step 0: {:.2f}".format(hit_fraction))
+    print("  Rays moved after step 0: {:.4f}".format(hit_fraction))
 
-    assert hit_fraction > 0.9
+    # 大部分光线应命中（除了从盒子外穿出的少数）
+    assert hit_fraction > 0.9, \
+        "Too few rays moved: {:.4f}".format(hit_fraction)
 
+    # 额外检查：确认有反射发生（R 或 T 非零）
+    R = out["reflectivity"][:, 1, 0]
+    T = out["transmissivity"][:, 1, 0]
+    events = (R + T) > 1e-6
+    n_events = events.sum().item()
 
-if __name__ == "__main__":
-    import sys
-    sys.exit(pytest.main([__file__, "-v", "-s"]))
+    print("  Interface events: {} / {}".format(n_events, rays["origins"].shape[0]))
+    assert n_events > 0, "No interface events detected"
