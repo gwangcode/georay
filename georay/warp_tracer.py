@@ -1464,6 +1464,13 @@ class WarpTracer:
     def trace(self, ray_dict, max_steps=50, ds_init=0.02, ds_min=1e-3,
               ds_max=0.1, rk_tol=1e-4, fresnel=True, verbose=False,
               surface_model=None, rr_threshold=0.0, seed=42):
+        """追踪光线。
+
+        Args:
+            ray_dict: generate_rays() 的输出。
+                可选键 "medium_ids": [N] long tensor，每条光线的初始介质 ID。
+            ...
+        """
         if surface_model is None:
             surface_model = "coated" if fresnel else "custom"
         if surface_model not in ("fresnel", "custom", "coated"):
@@ -1477,25 +1484,27 @@ class WarpTracer:
         dirs = ray_dict["dirs"].to(self.device).contiguous().float()
         stokes = ray_dict["stokes"].to(self.device).contiguous().float()
         wavelengths = ray_dict["wavelengths"].to(self.device).contiguous().float().squeeze(-1)
-        # ★ 支持 ray_dict["medium_ids"]
+
+        # ★ N 必须在 medium_ids 处理之前定义
+        N = origins.shape[0]
+        S = max_steps + 1
+
+        # ★ 支持 ray_dict["medium_ids"]：每条光线的初始介质
         if "medium_ids" in ray_dict:
             mid = ray_dict["medium_ids"]
             if isinstance(mid, int):
                 medium_ids_t = torch.full((N,), int(mid), dtype=torch.int32,
-                                            device=self.device)
+                                          device=self.device)
             else:
                 medium_ids_t = mid.to(dtype=torch.int32, device=self.device).contiguous()
                 if medium_ids_t.shape[0] != N:
                     raise ValueError(
-                        f"ray_dict['medium_ids'] length {medium_ids_t.shape[0]} "
-                        f"does not match number of rays {N}")
+                        "ray_dict['medium_ids'] length {} "
+                        "does not match number of rays {}".format(
+                            medium_ids_t.shape[0], N))
         else:
             medium_ids_t = torch.zeros(N, dtype=torch.int32, device=self.device)
-
         wp_medium_ids = wp.from_torch(medium_ids_t, dtype=wp.int32)
-
-        N = origins.shape[0]
-        S = max_steps + 1
 
         wp_origins = wp.from_torch(origins, dtype=wp.vec3)
         wp_dirs = wp.from_torch(dirs, dtype=wp.vec3)

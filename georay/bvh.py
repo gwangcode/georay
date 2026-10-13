@@ -1,10 +1,4 @@
-"""BVH acceleration structure and triangle mesh intersector.
-
-回滚到原始 while 循环版本。原版在 CPU/GPU 上都比"全向量化重写"更快，
-因为原版只在确有工作时才处理，而不是无差别对全部 N 条光线做叶子测试。
-
-新增：可选的 torch.compile 包装（默认关闭）。
-"""
+"""BVH acceleration structure and triangle mesh intersector."""
 import torch
 
 
@@ -76,13 +70,16 @@ class BVH:
 
     @torch.no_grad()
     def ray_cast(self, ray_origins, ray_dirs, allowed_face_mask=None, eps=1e-4):
-        """Public entry point — delegates to _ray_cast_impl."""
-        return self._ray_cast_impl(ray_origins, ray_dirs,
-                                   allowed_face_mask, eps)
-
-    def _ray_cast_impl(self, ray_origins, ray_dirs, allowed_face_mask=None, eps=1e-4):
-        """原始 while 循环实现。这是经过验证的最快纯 PyTorch 版本。"""
         N = ray_origins.shape[0]
+
+        # ★ 空 BVH：所有光线 miss
+        if self.num_faces == 0:
+            min_hit_t = torch.full((N,), float('inf'), device=self.device)
+            hit_face_idx = torch.full((N,), -1, dtype=torch.long, device=self.device)
+            hit_u = torch.zeros((N,), device=self.device)
+            hit_v = torch.zeros((N,), device=self.device)
+            return min_hit_t, hit_face_idx, hit_u, hit_v
+
         safe_dirs = torch.where(torch.abs(ray_dirs) < 1e-8,
                                 torch.where(ray_dirs >= 0,
                                             torch.full_like(ray_dirs, 1e-8),
@@ -123,7 +120,6 @@ class BVH:
             hit_aabb = active_mask & (t_far >= torch.maximum(
                 t_near, torch.zeros_like(t_near))) & (t_near < min_hit_t)
 
-            # ---- Leaf test (conditional) ----
             leaf_hits = hit_aabb & leaf_flag
             if leaf_hits.any():
                 hit_ray_indices = torch.where(leaf_hits)[0]
@@ -193,7 +189,6 @@ class BVH:
                     hit_u[target_rays] = s_u[target_indices]
                     hit_v[target_rays] = s_v[target_indices]
 
-            # ---- Inner node push (conditional) ----
             inner_hits = hit_aabb & (~leaf_flag)
             if inner_hits.any():
                 can_push = stack_ptr < (self.stack_capacity - 1)
@@ -214,57 +209,46 @@ class BVH:
 
 
 class BVHMeshIntersector:
-    """Mesh intersector with BVH acceleration.
+    """Mesh intersector with BVH acceleration."""
 
-    Args:
-        vertices, faces, device: 与原来相同。
-        use_compile: 若为 True，用 torch.compile(mode="reduce-overhead")
-            包装 ray_cast。首次调用会触发编译（数十秒），
-            之后可能带来 1.5~3× 加速（取决于场景）。
-            对 while 循环，torch.compile 会产生图断点，
-            因此**不保证**一定加速——请用基准测试验证。
-    """
-
-    def __init__(self, vertices, faces, device, use_compile: bool = False):
+    def __init__(self, vertices, faces, device):
         self.device = device
         self.vertices = vertices.to(dtype=torch.float32, device=device)
         self.faces = faces.to(dtype=torch.long, device=device)
+        self.num_faces = faces.shape[0]
+
+        # ★ 空网格：不做 BVH 构建
+        if self.num_faces == 0:
+            self.triangles = torch.zeros((0, 3, 3), dtype=torch.float32,
+                                          device=device)
+            self.face_normals = torch.zeros((0, 3), dtype=torch.float32,
+                                             device=device)
+            self.bvh = None
+            return
+
         self.triangles = self.vertices[self.faces]
         e1 = self.triangles[:, 1] - self.triangles[:, 0]
         e2 = self.triangles[:, 2] - self.triangles[:, 0]
         raw_normals = torch.cross(e1, e2, dim=-1)
-        self.face_normals = raw_normals / (torch.norm(raw_normals,
-                                                      dim=-1, keepdim=True) + 1e-12)
+        self.face_normals = raw_normals / (torch.norm(raw_normals, dim=-1, keepdim=True) + 1e-12)
         self.bvh = BVH(self.triangles)
-
-        self._use_compile = False
-        self._compiled_ray_cast = None
-        if use_compile:
-            try:
-                # 注意：只编译 _ray_cast_impl，不动 __init__
-                self._compiled_ray_cast = torch.compile(
-                    self.bvh._ray_cast_impl,
-                    mode="reduce-overhead",
-                    fullgraph=False,
-                    dynamic=False,
-                )
-                self._use_compile = True
-                print("[BVHMeshIntersector] torch.compile enabled "
-                      "(first call will be slow — compiling)")
-            except Exception as e:
-                print(f"[BVHMeshIntersector] torch.compile failed: {e}. "
-                      f"Falling back to eager.")
-                self._use_compile = False
 
     def intersect(self, ray_origins, ray_dirs, prev_face_ids=None,
                   allowed_face_mask=None, eps=1e-4):
-        if self._use_compile and self._compiled_ray_cast is not None:
-            hit_dist, hit_face_ids, _, _ = self._compiled_ray_cast(
-                ray_origins, ray_dirs, allowed_face_mask, eps)
-        else:
-            hit_dist, hit_face_ids, _, _ = self.bvh.ray_cast(
-                ray_origins, ray_dirs, allowed_face_mask, eps)
+        N = ray_origins.shape[0]
 
+        # ★ 空网格：所有光线 miss
+        if self.num_faces == 0 or self.bvh is None:
+            hit_dist = torch.full((N,), float('inf'),
+                                   dtype=torch.float32, device=self.device)
+            hit_face_ids = torch.full((N,), -1, dtype=torch.long,
+                                       device=self.device)
+            hit_normals = torch.zeros((N, 3), dtype=torch.float32,
+                                       device=self.device)
+            return hit_dist, hit_face_ids, hit_normals
+
+        hit_dist, hit_face_ids, _, _ = self.bvh.ray_cast(
+            ray_origins, ray_dirs, allowed_face_mask=allowed_face_mask)
         hit_mask = (hit_dist > eps) & (hit_dist < float('inf'))
         if prev_face_ids is not None:
             hit_mask = hit_mask & (hit_face_ids != prev_face_ids)
@@ -272,7 +256,6 @@ class BVHMeshIntersector:
                                    torch.tensor(-1, device=self.device))
         hit_dist = torch.where(hit_mask, hit_dist,
                                torch.tensor(float('inf'), device=self.device))
-        safe_ids = torch.clamp(hit_face_ids, 0,
-                               max(self.faces.shape[0] - 1, 0))
+        safe_ids = torch.clamp(hit_face_ids, 0, max(self.faces.shape[0] - 1, 0))
         hit_normals = self.face_normals[safe_ids]
         return hit_dist, hit_face_ids, hit_normals
