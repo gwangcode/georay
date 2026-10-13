@@ -242,20 +242,25 @@ def test_coplanar_prev_face_handling():
     """
     prev_face_ids 机制必须正确处理共面接触。
 
-    关键设计：使用极小的 max_steps=5。
-    如果 prev_face 排除逻辑有问题，光线会卡在共面接触面上
-    来回弹跳，无法在 5 步内逃逸。这是一个强有力的一致性检测。
+    关键设计：
+      - 使用 surface_model="custom" + reflectivity=0
+        → 强制 100% 折射，消除 Fresnel 反射干扰
+      - 使用极小的 max_steps=5
+        → 若 prev_face 排除逻辑有问题，光线会卡在共面接触面上
+          无限来回弹跳，无法在 5 步内逃逸
     """
     device = torch.device("cpu")
     verts, faces, fm = make_two_cubes_sharing_face_x(device)
+
+    # ★ 关键修改：reflectivity=0 + custom 模式 → 纯折射
     materials = {
-        0: {"n": 1.0, "reflectivity": 1.0, "diffuse": 0.0, "absorptivity": 0.0},
-        1: {"n": 1.5, "reflectivity": 1.0, "diffuse": 0.0, "absorptivity": 0.0},
+        0: {"n": 1.0, "reflectivity": 0.0, "diffuse": 0.0, "absorptivity": 0.0},
+        1: {"n": 1.5, "reflectivity": 0.0, "diffuse": 0.0, "absorptivity": 0.0},
     }
 
     rays = make_rays_along_x(device, n=32)
     tracer = AdvancedRayTracerPBRTGPU(verts, faces, fm, materials, device)
-    out = tracer.trace(rays, max_steps=5, surface_model="fresnel")
+    out = tracer.trace(rays, max_steps=5, surface_model="custom")
 
     # ---- 所有光线必须在 5 步内逃逸 ----
     final_active = out["active"][:, -1]
@@ -287,7 +292,6 @@ def test_coplanar_prev_face_handling():
         if term_step is not None:
             print(f"  ray {n}: escaped at step {term_step}, "
                   f"final pos = {[round(v, 4) for v in pos[n, term_step].tolist()]}")
-
 
 # ==============================================================================
 # Entry point

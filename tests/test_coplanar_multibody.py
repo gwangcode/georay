@@ -104,8 +104,16 @@ def make_heterogeneous_coplanar_x(device):
     """
     左侧: n=1.5 玻璃 (x ∈ [-1, 0])
     右侧: n=1.7 玻璃 (x ∈ [ 0, 1])
-    共享 x=0 平面。两侧材质不同，穿过时有真正的界面。
+    共享 x=0 平面。
+
+    ★ 关键：正确设置 x=0 处两个面的 face_materials。
+        cube A 的 +x 面（法线朝 +x）外部是 cube B 的内部 (mat 2)
+        cube B 的 -x 面（法线朝 -x）外部是 cube A 的内部 (mat 1)
+
+    这样无论 tracer 命中哪个面，都能正确识别 n=1.5 → n=1.7。
     """
+    import numpy as np
+
     a = trimesh.creation.box(extents=[1.0, 2.0, 2.0])
     a.apply_translation([-0.5, 0.0, 0.0])
     n_faces_a = len(a.faces)
@@ -114,14 +122,29 @@ def make_heterogeneous_coplanar_x(device):
     b.apply_translation([0.5, 0.0, 0.0])
 
     combined = trimesh.util.concatenate([a, b])
-    verts = torch.tensor(combined.vertices, dtype=torch.float32, device=device)
-    faces = torch.tensor(combined.faces, dtype=torch.long, device=device)
+    verts_np = combined.vertices.copy()
+    faces_np = combined.faces.copy()
 
-    fm = torch.zeros((faces.shape[0], 2), dtype=torch.long, device=device)
-    fm[:, 0] = 0
-    fm[:n_faces_a, 1] = 1   # cube A 内部 → mat 1
-    fm[n_faces_a:, 1] = 2   # cube B 内部 → mat 2
+    verts = torch.tensor(verts_np, dtype=torch.float32, device=device)
+    faces = torch.tensor(faces_np, dtype=torch.long, device=device)
 
+    fm_np = np.zeros((len(faces_np), 2), dtype=np.int64)
+    fm_np[:n_faces_a, 1] = 1   # cube A 内部 = mat 1 (n=1.5)
+    fm_np[n_faces_a:, 1] = 2   # cube B 内部 = mat 2 (n=1.7)
+
+    # ★ 手动修正 x=0 处的面
+    for i in range(len(faces_np)):
+        f = faces_np[i]
+        if np.all(np.abs(verts_np[f, 0]) < 1e-6):
+            # 这个面在 x=0 处
+            if i < n_faces_a:
+                # cube A 的 +x 面，外部是 cube B 的内部
+                fm_np[i, 0] = 2
+            else:
+                # cube B 的 -x 面，外部是 cube A 的内部
+                fm_np[i, 0] = 1
+
+    fm = torch.tensor(fm_np, dtype=torch.long, device=device)
     return verts, faces, fm, n_faces_a
 
 
