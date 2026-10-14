@@ -16,22 +16,14 @@ from .polarization import (
     degree_of_polarization,
 )
 
+
 def _validate_materials_cfg(materials_cfg, face_materials):
-    """
-    验证 materials_cfg 和 face_materials 的合法性。
-
-    在 tracer.__init__ 早期调用，让非法配置在构造时立即报错，
-    而不是追踪中途崩溃。
-
-    Raises:
-        ValueError: 配置不合法。
-    """
+    """验证 materials_cfg 和 face_materials 的合法性。"""
     if not isinstance(materials_cfg, dict) or len(materials_cfg) == 0:
         raise ValueError(
             "materials_cfg must be a non-empty dict, got {}".format(
                 type(materials_cfg)))
 
-    # 检查 face_materials 引用的所有材质 ID 都定义在 materials_cfg 中
     if face_materials is not None and face_materials.numel() > 0:
         unique_ids = torch.unique(face_materials).tolist()
         defined = set(materials_cfg.keys())
@@ -52,26 +44,21 @@ def _validate_materials_cfg(materials_cfg, face_materials):
                 "materials_cfg[{}] must be a dict, got {}".format(
                     mat_id, type(cfg)))
 
-        # n 必须存在或使用默认值；如果显式给出必须 > 0
         if "n" in cfg:
             n_val = cfg["n"]
-            if isinstance(n_val, (int, float)):
-                if n_val <= 0:
-                    raise ValueError(
-                        "materials_cfg[{}]['n'] = {} must be > 0".format(
-                            mat_id, n_val))
+            if isinstance(n_val, (int, float)) and n_val <= 0:
+                raise ValueError(
+                    "materials_cfg[{}]['n'] = {} must be > 0".format(
+                        mat_id, n_val))
 
-        # reflectivity / diffuse / absorptivity 若为标量应在 [0, 1]
         for field in ("reflectivity", "diffuse", "absorptivity"):
             if field in cfg:
                 v = cfg[field]
-                if isinstance(v, (int, float)):
-                    if v < 0.0 or v > 1.0:
-                        raise ValueError(
-                            "materials_cfg[{}]['{}'] = {} must be in [0, 1]".format(
-                                mat_id, field, v))
+                if isinstance(v, (int, float)) and (v < 0.0 or v > 1.0):
+                    raise ValueError(
+                        "materials_cfg[{}]['{}'] = {} must be in [0, 1]".format(
+                            mat_id, field, v))
 
-        # grin_field 若存在必须是 dict 或 callable
         if "grin_field" in cfg and cfg["grin_field"] is not None:
             gf = cfg["grin_field"]
             if not (isinstance(gf, dict) or callable(gf)):
@@ -85,8 +72,7 @@ def _validate_materials_cfg(materials_cfg, face_materials):
                 if gtype not in valid_types:
                     raise ValueError(
                         "materials_cfg[{}]['grin_field']['type'] = '{}' "
-                        "must be one of {}".format(
-                            mat_id, gtype, valid_types))
+                        "must be one of {}".format(mat_id, gtype, valid_types))
 
                 if gtype == "parabolic":
                     if "n0" in gf and gf["n0"] <= 0:
@@ -98,24 +84,71 @@ def _validate_materials_cfg(materials_cfg, face_materials):
                             "materials_cfg[{}]['grin_field']['A'] = {} "
                             "must be >= 0".format(mat_id, gf["A"]))
 
+def _ray_box_exit_distance(origins, dirs, box_min, box_max, default_dist):
+    """
+    计算每条光线沿其方向从 box 内"逃逸"的距离。
+
+    使用 slab method（标准 ray-AABB 求交）。
+
+    Args:
+        origins: [K, 3] 光线起点
+        dirs:    [K, 3] 光线方向（归一化）
+        box_min: [3] box 最小角
+        box_max: [3] box 最大角
+        default_dist: 如果 ray-box 求交失败（光线根本不穿过 box），
+                      用这个默认距离
+
+    Returns:
+        [K] 每条光线的逃逸距离（>= 0）
+    """
+    eps = 1e-12
+    # 防止除零：方向分量为 0 时替换为很小的值
+    safe_dirs = torch.where(
+        dirs.abs() < eps,
+        torch.where(dirs >= 0,
+                    torch.full_like(dirs, eps),
+                    torch.full_like(dirs, -eps)),
+        dirs)
+    inv_dir = 1.0 / safe_dirs  # [K, 3]
+
+    # slab method
+    t1 = (box_min.unsqueeze(0) - origins) * inv_dir  # [K, 3]
+    t2 = (box_max.unsqueeze(0) - origins) * inv_dir  # [K, 3]
+
+    t_near = torch.minimum(t1, t2).max(dim=-1)[0]  # [K]
+    t_far  = torch.maximum(t1, t2).min(dim=-1)[0]  # [K]
+
+    # 有效性：t_far >= max(t_near, 0) 且 t_far >= 0
+    valid = (t_far >= torch.maximum(t_near, torch.zeros_like(t_near))) & (t_far >= 0.0)
+
+    dist = torch.where(valid, t_far, torch.full_like(t_far, default_dist))
+    return dist
 
 class AdvancedRayTracerPBRTGPU:
-    """GPU-accelerated ray tracer with BVH, GRIN, and polarization support.
-
-    Supports:
-        - BVH-accelerated triangle mesh intersection
-        - Adaptive RK4 for gradient-index media
-        - Full Stokes polarization tracking via Jones-Mueller formalism
-        - Fresnel reflection/refraction with polarization-weighted reflectance
-        - TIR, diffuse, absorption
-        - Energy conservation checks
-        - Rays starting inside a dielectric or GRIN medium (via ray_dict['medium_ids'])
-    """
+    """GPU-accelerated ray tracer with BVH, GRIN, and polarization support."""
 
     def __init__(self, vertices, faces, face_materials, materials_cfg, device):
         _validate_materials_cfg(materials_cfg, face_materials)
+
         self.device = device
         self.intersector = BVHMeshIntersector(vertices, faces, device)
+
+        # ★ 场景包围盒对角线 —— 用于逃逸光线的远场延伸
+        # ★ 场景包围盒 —— 逃逸光线终止于 bbox 边界
+        if vertices.numel() > 0:
+            v_min = vertices.min(dim=0)[0].to(device)
+            v_max = vertices.max(dim=0)[0].to(device)
+            diag = float((v_max - v_min).norm().item())
+            self.scene_diag = diag if diag > 1e-6 else 1.0
+            # 加 5% padding，避免光线终点刚好在边界上（视觉上更自然）
+            pad = 0.05 * (v_max - v_min)
+            self.scene_bbox_min = v_min - pad
+            self.scene_bbox_max = v_max + pad
+        else:
+            self.scene_bbox_min = torch.tensor([-1.0, -1.0, -1.0], device=device)
+            self.scene_bbox_max = torch.tensor([1.0, 1.0, 1.0], device=device)
+            self.scene_diag = 1.0
+
         self.face_materials = face_materials.to(dtype=torch.long, device=device)
         self.materials_cfg = materials_cfg
         self.num_faces = faces.shape[0]
@@ -156,7 +189,6 @@ class AdvancedRayTracerPBRTGPU:
 
         self.max_medium_id = max_med
 
-        # Precompute scalar material lookup table
         self.max_mat_id = max(materials_cfg.keys()) if materials_cfg else 0
         self.all_simple = self._check_all_simple(materials_cfg)
         if self.all_simple:
@@ -183,33 +215,13 @@ class AdvancedRayTracerPBRTGPU:
     def trace(self, ray_dict, max_steps=50, ds_init=0.02, ds_min=1e-3,
               ds_max=0.1, rk_tol=1e-4, fresnel=True, verbose=False,
               surface_model=None, rr_threshold=0.0):
-        """
-        Trace rays through the scene.
-
-        Args:
-            ray_dict: output of generate_rays().
-                Optional key "medium_ids": [N] long tensor, initial medium
-                ID per ray. Defaults to all zeros (air/vacuum).
-            max_steps, ds_init, ds_min, ds_max, rk_tol: integrator params.
-            fresnel: legacy flag.
-            surface_model: "fresnel" | "custom" | "coated".
-            verbose: print GRIN step diagnostics.
-            rr_threshold: Russian roulette threshold (0 disables).
-
-        Returns:
-            dict with keys: positions, stokes, active, wavelengths,
-                            reflectivity, transmissivity, absorptivity,
-                            n1, n2, polarization_deg, dop,
-                            energy, rk_error, ds_history, energy_conserved.
-        """
         if surface_model is None:
             surface_model = "coated" if fresnel else "custom"
         if surface_model not in ("fresnel", "custom", "coated"):
             raise ValueError(
-                f"surface_model must be 'fresnel', 'custom', or 'coated', "
-                f"got '{surface_model}'")
+                "surface_model must be 'fresnel', 'custom', or 'coated', "
+                "got '{}'".format(surface_model))
 
-        # ---- Initialize state ----
         curr_origins = ray_dict["origins"].clone()
         curr_dirs = ray_dict["dirs"].clone()
         curr_wls = ray_dict["wavelengths"].clone()
@@ -219,28 +231,25 @@ class AdvancedRayTracerPBRTGPU:
 
         N = curr_origins.shape[0]
 
-        # ★ 支持 ray_dict["medium_ids"]：每条光线的初始介质
         if "medium_ids" in ray_dict:
             mid = ray_dict["medium_ids"]
             if isinstance(mid, int):
                 curr_medium_ids = torch.full((N,), int(mid), dtype=torch.long,
                                               device=self.device)
             else:
-                curr_medium_ids = mid.to(dtype=torch.long, device=self.device).clone()
-                if curr_medium_ids.shape[0] != N:
-                    raise ValueError(
-                        f"ray_dict['medium_ids'] length {curr_medium_ids.shape[0]} "
-                        f"does not match number of rays {N}")
+                curr_medium_ids = mid.to(dtype=torch.long,
+                                          device=self.device).clone()
         else:
-            curr_medium_ids = torch.zeros(N, dtype=torch.long, device=self.device)
+            curr_medium_ids = torch.zeros(N, dtype=torch.long,
+                                            device=self.device)
 
-        prev_hit_faces = torch.full((N,), -1, dtype=torch.long, device=self.device)
+        prev_hit_faces = torch.full((N,), -1, dtype=torch.long,
+                                     device=self.device)
         active_mask = torch.ones(N, dtype=torch.bool, device=self.device)
 
         curr_weight = torch.ones(N, device=self.device)
         ds_per_ray = torch.full((N,), float(ds_init), device=self.device)
 
-        # ---- History buffers ----
         hist_pos = [curr_origins.clone()]
         hist_stokes = [curr_stokes.clone()]
         hist_active = [active_mask.clone()]
@@ -250,7 +259,7 @@ class AdvancedRayTracerPBRTGPU:
         hist_n1 = [torch.ones((N, 1), device=self.device)]
         hist_n2 = [torch.ones((N, 1), device=self.device)]
         hist_pol_deg = [0.5 * torch.atan2(curr_stokes[:, 2:3],
-                                          curr_stokes[:, 1:2]) * (180.0 / math.pi)]
+                                            curr_stokes[:, 1:2]) * (180.0 / math.pi)]
         hist_energy = [curr_weight.clone()]
         hist_rk_err = [torch.zeros(N, device=self.device)]
         hist_ds = [ds_per_ray.clone()]
@@ -263,7 +272,8 @@ class AdvancedRayTracerPBRTGPU:
 
             # ---------- 1. Intersection ----------
             hit_dist = torch.full((N,), float('inf'), device=self.device)
-            hit_face_ids = torch.full((N,), -1, dtype=torch.long, device=self.device)
+            hit_face_ids = torch.full((N,), -1, dtype=torch.long,
+                                       device=self.device)
             hit_normals = torch.zeros((N, 3), device=self.device)
 
             for med_val in range(self.max_medium_id + 1):
@@ -299,25 +309,27 @@ class AdvancedRayTracerPBRTGPU:
             grin_mask = active_mask & is_in_grin & (hit_dist > ds_per_ray)
 
             if grin_mask.any():
-                pol_vec_all = stokes_to_pol_vector(curr_stokes, curr_s_ref, curr_p_ref)
+                pol_vec_all = stokes_to_pol_vector(curr_stokes, curr_s_ref,
+                                                     curr_p_ref)
                 dop_all = degree_of_polarization(curr_stokes)
 
                 if len(self.grin_fields) == 1:
                     g_val, field = next(iter(self.grin_fields.items()))
                     sub_mask = grin_mask & (curr_medium_ids == g_val)
                     if sub_mask.any():
-                        field.set_context(pol_vec_all[sub_mask], dop_all[sub_mask])
+                        field.set_context(pol_vec_all[sub_mask],
+                                            dop_all[sub_mask])
                         h_sub = ds_per_ray[sub_mask]
                         r_new, d_new, n_eval, h_new, err_new, accepted = \
                             adaptive_rk4_step_per_ray(
-                                curr_origins[sub_mask], curr_dirs[sub_mask], field,
-                                curr_wls[sub_mask], h_per_ray=h_sub,
+                                curr_origins[sub_mask], curr_dirs[sub_mask],
+                                field, curr_wls[sub_mask], h_per_ray=h_sub,
                                 tol=rk_tol, h_min=ds_min, h_max=ds_max)
                         s_old = curr_s_ref[sub_mask]
                         s_proj = torch.sum(s_old * d_new, dim=-1, keepdim=True)
                         s_candidate = s_old - s_proj * d_new
                         s_candidate = s_candidate / (
-                                torch.norm(s_candidate, dim=-1, keepdim=True) + 1e-12)
+                            torch.norm(s_candidate, dim=-1, keepdim=True) + 1e-12)
                         stokes_candidate = rotate_stokes_reference(
                             curr_stokes[sub_mask], s_old, s_candidate, d_new)
                         acc_3d = accepted.unsqueeze(-1)
@@ -339,11 +351,6 @@ class AdvancedRayTracerPBRTGPU:
                         step_rk_err[sub_mask] = err_new
                         ds_per_ray[sub_mask] = h_new
                         field.clear_context()
-                        if verbose and step % 5 == 0:
-                            print(f"  [GRIN step={step} med={g_val}] "
-                                  f"ds=[{h_new.min().item():.5f}, "
-                                  f"{h_new.max().item():.5f}], "
-                                  f"acc={accepted.float().mean().item():.1%}")
                 else:
                     grin_meds = torch.unique(curr_medium_ids[grin_mask])
                     for g_med_id in grin_meds:
@@ -352,18 +359,19 @@ class AdvancedRayTracerPBRTGPU:
                         if not sub_mask.any():
                             continue
                         field = self.grin_fields[g_val]
-                        field.set_context(pol_vec_all[sub_mask], dop_all[sub_mask])
+                        field.set_context(pol_vec_all[sub_mask],
+                                            dop_all[sub_mask])
                         h_sub = ds_per_ray[sub_mask]
                         r_new, d_new, n_eval, h_new, err_new, accepted = \
                             adaptive_rk4_step_per_ray(
-                                curr_origins[sub_mask], curr_dirs[sub_mask], field,
-                                curr_wls[sub_mask], h_per_ray=h_sub,
+                                curr_origins[sub_mask], curr_dirs[sub_mask],
+                                field, curr_wls[sub_mask], h_per_ray=h_sub,
                                 tol=rk_tol, h_min=ds_min, h_max=ds_max)
                         s_old = curr_s_ref[sub_mask]
                         s_proj = torch.sum(s_old * d_new, dim=-1, keepdim=True)
                         s_candidate = s_old - s_proj * d_new
                         s_candidate = s_candidate / (
-                                torch.norm(s_candidate, dim=-1, keepdim=True) + 1e-12)
+                            torch.norm(s_candidate, dim=-1, keepdim=True) + 1e-12)
                         stokes_candidate = rotate_stokes_reference(
                             curr_stokes[sub_mask], s_old, s_candidate, d_new)
                         acc_3d = accepted.unsqueeze(-1)
@@ -400,7 +408,7 @@ class AdvancedRayTracerPBRTGPU:
                 s_ref_in = curr_s_ref[mesh_hit_mask]
 
                 cos_theta_i_raw = -torch.sum(dirs_in * normals, dim=-1,
-                                             keepdim=True)
+                                               keepdim=True)
                 is_front = cos_theta_i_raw > 0.0
                 oriented_normals = torch.where(is_front, normals, -normals)
                 cos_theta_i = torch.clamp(torch.abs(cos_theta_i_raw), 0.0, 1.0)
@@ -490,7 +498,7 @@ class AdvancedRayTracerPBRTGPU:
                 else:
                     specular_R = R_eff * custom_refl
                 specular_R = torch.where(is_tir, torch.ones_like(specular_R),
-                                         specular_R)
+                                          specular_R)
 
                 P_absorb = torch.clamp(custom_abs, 0.0, 1.0)
                 P_diffuse = (1.0 - P_absorb) * torch.clamp(custom_diff, 0.0, 1.0)
@@ -525,7 +533,7 @@ class AdvancedRayTracerPBRTGPU:
                 sin_theta_d = torch.sqrt(r_sq)
                 cos_theta_d = torch.sqrt(1.0 - r_sq)
                 phi_d = 2.0 * math.pi * torch.rand(num_hits, 1,
-                                                   device=self.device)
+                                                     device=self.device)
                 ref_vecs = torch.zeros_like(oriented_normals)
                 ref_vecs[:, 2] = 1.0
                 ref_vecs[torch.abs(oriented_normals[:, 2]) > 0.999] = \
@@ -554,7 +562,7 @@ class AdvancedRayTracerPBRTGPU:
                 )
                 new_weight = next_weight[mesh_hit_mask].unsqueeze(-1) * branch_prob
                 new_weight = torch.where(is_abs, torch.zeros_like(new_weight),
-                                         new_weight)
+                                          new_weight)
                 next_weight[mesh_hit_mask] = new_weight.squeeze(-1)
 
                 K = mesh_hit_mask.sum().item()
@@ -566,9 +574,7 @@ class AdvancedRayTracerPBRTGPU:
                     surv_prob = (cur_w / rr_threshold).clamp(0.0, 1.0)
                     surv = torch.rand_like(cur_w) < surv_prob
                     boosted = torch.where(
-                        surv,
-                        torch.full_like(cur_w, rr_threshold),
-                        cur_w)
+                        surv, torch.full_like(cur_w, rr_threshold), cur_w)
                     next_weight[mesh_hit_mask] = torch.where(
                         needs_rr, boosted, cur_w)
                     rr_kill = needs_rr & (~surv)
@@ -612,10 +618,18 @@ class AdvancedRayTracerPBRTGPU:
                     active_mask[rr_idx] = False
 
             # ---------- 5. Escape ----------
+            # ★ 逃逸光线终止于场景 bbox 边界（在边界处飞出场景）
             no_hit_mask = active_mask & (~grin_mask) & (hit_face_ids < 0)
             if no_hit_mask.any():
-                next_origins[no_hit_mask] = curr_origins[no_hit_mask] + \
-                                            curr_dirs[no_hit_mask] * 1.0
+                origins_nh = curr_origins[no_hit_mask]
+                dirs_nh = curr_dirs[no_hit_mask]
+                default_dist = 2.0 * self.scene_diag
+                t_exit = _ray_box_exit_distance(
+                    origins_nh, dirs_nh,
+                    self.scene_bbox_min, self.scene_bbox_max,
+                    default_dist)
+                next_origins[no_hit_mask] = origins_nh + \
+                                            dirs_nh * t_exit.unsqueeze(-1)
                 active_mask[no_hit_mask] = False
 
             # ---------- 6. Update ----------

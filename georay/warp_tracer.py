@@ -554,6 +554,55 @@ def eval_property(
 
 
 @wp.func
+def ray_box_exit_distance(
+    origin: wp.vec3,
+    d: wp.vec3,
+    bbox_min: wp.vec3,
+    bbox_max: wp.vec3,
+    default_dist: wp.float32,
+) -> wp.float32:
+    """Slab method: 光线与 AABB 的远交点距离（t_far）。
+
+    如果光线完全不穿过 bbox，返回 default_dist。
+    """
+    eps = wp.float32(1e-12)
+
+    # 防止除零
+    safe_dx = wp.where(wp.abs(d[0]) < eps,
+                       wp.where(d[0] >= 0.0, eps, -eps), d[0])
+    safe_dy = wp.where(wp.abs(d[1]) < eps,
+                       wp.where(d[1] >= 0.0, eps, -eps), d[1])
+    safe_dz = wp.where(wp.abs(d[2]) < eps,
+                       wp.where(d[2] >= 0.0, eps, -eps), d[2])
+    inv_dx = 1.0 / safe_dx
+    inv_dy = 1.0 / safe_dy
+    inv_dz = 1.0 / safe_dz
+
+    # slab 交点
+    t1x = (bbox_min[0] - origin[0]) * inv_dx
+    t2x = (bbox_max[0] - origin[0]) * inv_dx
+    t1y = (bbox_min[1] - origin[1]) * inv_dy
+    t2y = (bbox_max[1] - origin[1]) * inv_dy
+    t1z = (bbox_min[2] - origin[2]) * inv_dz
+    t2z = (bbox_max[2] - origin[2]) * inv_dz
+
+    t_near_x = wp.min(t1x, t2x)
+    t_near_y = wp.min(t1y, t2y)
+    t_near_z = wp.min(t1z, t2z)
+    t_far_x = wp.max(t1x, t2x)
+    t_far_y = wp.max(t1y, t2y)
+    t_far_z = wp.max(t1z, t2z)
+
+    t_near = wp.max(wp.max(t_near_x, t_near_y), t_near_z)
+    t_far = wp.min(wp.min(t_far_x, t_far_y), t_far_z)
+
+    # 有效性：t_far >= max(t_near, 0)
+    valid = (t_far >= wp.max(t_near, 0.0)) and (t_far >= 0.0)
+    if valid:
+        return t_far
+    return default_dist
+
+@wp.func
 def eval_grin_n_and_grad(
     mat_id: wp.int32,
     pos: wp.vec3,
@@ -666,6 +715,9 @@ def trace_kernel(
     max_steps: wp.int32,
     eps: wp.float32,
     far: wp.float32,
+    far_escape: wp.float32,
+    scene_bbox_min: wp.vec3,
+    scene_bbox_max: wp.vec3,
     seed: wp.int32,
     surface_model_flag: wp.int32,
     ds_init: wp.float32,
@@ -830,7 +882,16 @@ def trace_kernel(
             cur_n2 = wp.float32(1.0)
 
             if not q.result:
-                origin = origin + d * 1.0
+                # ★ 逃逸光线终止于场景 bbox 边界
+                default_dist = 2.0 * far_escape / 100.0  # 用 scene_diag 的 2 倍
+                # 注意：far_escape 在 __init__ 里设为 100*scene_diag
+                # 所以 far_escape/100 = scene_diag
+                t_exit = ray_box_exit_distance(
+                    origin, d, scene_bbox_min, scene_bbox_max,
+                    default_dist)
+                # 光线至少走一点点，避免 t_exit = 0
+                t_exit = wp.max(t_exit, wp.float32(0.1))
+                origin = origin + d * t_exit
                 active = wp.int32(0)
             else:
                 t_hit = q.t
@@ -1278,6 +1339,19 @@ class WarpTracer:
             indices=wp.array(faces_np, dtype=wp.int32, device=self.warp_device),
         )
         self.mesh_id = self.mesh.id
+        # ★ 场景对角线（用于逃逸光线的远场延伸）
+        # ★ 场景 bbox —— 逃逸光线终止于 bbox 边界
+        v_min = verts_np.min(axis=0)
+        v_max = verts_np.max(axis=0)
+        diag = float(np.linalg.norm(v_max - v_min))
+        self.scene_diag = diag if diag > 1e-6 else 1.0
+        # far_escape 保留（用于传给 kernel 作为兜底），但实际用 bbox 边界
+        self.far_escape = max(100.0 * self.scene_diag, 1e5)
+
+        # bbox 加 5% padding（避免光线终点正好在边界上）
+        pad = 0.05 * (v_max - v_min)
+        self.scene_bbox_min_np = (v_min - pad).astype(np.float32)
+        self.scene_bbox_max_np = (v_max + pad).astype(np.float32)
 
         faces_long = faces.detach().cpu().numpy().astype(np.int64)
         tris = verts_np[faces_long]
@@ -1545,6 +1619,9 @@ class WarpTracer:
                 max_steps,
                 np.float32(1e-4),
                 np.float32(1e10),
+                np.float32(self.far_escape),
+                wp.vec3(*self.scene_bbox_min_np.tolist()),
+                wp.vec3(*self.scene_bbox_max_np.tolist()),
                 int(seed),
                 int(surface_model_flag),
                 np.float32(ds_init),
