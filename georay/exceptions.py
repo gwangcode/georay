@@ -1,41 +1,43 @@
 """
-GeoRay 自定义异常类。
+GeoRay custom exception classes.
 
-设计原则：
-    * 所有异常继承 GeoRayError，方便统一捕获
-    * 关键异常同时继承 ValueError / RuntimeError，保持向后兼容
-    * 每条错误信息包含"如何修复"的提示
+Design principles:
+    * All exceptions inherit from GeoRayError for unified catching.
+    * Critical exceptions also inherit ValueError / RuntimeError for
+      backward compatibility.
+    * Every error message includes a "how to fix" hint.
 """
 
 
 class GeoRayError(Exception):
-    """所有 GeoRay 异常的基类。"""
+    """Base class for all GeoRay exceptions."""
     pass
 
 
 class ConfigurationError(GeoRayError, ValueError):
-    """配置错误（材质、场景、参数等）。
+    """Invalid configuration (materials, scene, parameters, etc.).
 
-    同时继承 ValueError，保持与旧代码 `except ValueError` 的兼容性。
+    Also inherits ValueError for backward compatibility with code that
+    catches `except ValueError`.
     """
     pass
 
 
 class InvalidMaterialError(ConfigurationError):
-    """材质配置无效（n <= 0、reflectivity 越界等）。"""
+    """Invalid material configuration (n <= 0, reflectivity out of range, etc.)."""
     pass
 
 
 class InvalidRayError(GeoRayError, ValueError):
-    """光线数据无效（缺少字段、shape 不匹配等）。"""
+    """Invalid ray data (missing fields, shape mismatch, etc.)."""
     pass
 
 
 class GeometryError(GeoRayError, ValueError):
-    """几何数据无效（空网格、退化三角形等）。"""
+    """Invalid geometry (empty mesh, degenerate triangles, etc.)."""
     pass
 
 
 class BackendError(GeoRayError, RuntimeError):
-    """后端错误（Warp 未安装、CUDA 不可用等）。"""
+    """Backend error (Warp not installed, CUDA unavailable, etc.)."""
     pass
