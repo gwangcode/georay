@@ -677,18 +677,30 @@ class AdvancedRayTracerPBRTGPU:
                     active_mask[rr_idx] = False
 
             # ---------- 5. Escape ----------
-            # ★ 逃逸光线终止于场景 bbox 边界（在边界处飞出场景）
+            # Escaped rays terminate at the scene bbox boundary
             no_hit_mask = active_mask & (~grin_mask) & (hit_face_ids < 0)
             if no_hit_mask.any():
                 origins_nh = curr_origins[no_hit_mask]
                 dirs_nh = curr_dirs[no_hit_mask]
                 default_dist = 2.0 * self.scene_diag
+
+                # Ensure dtype consistency (bbox uses the same dtype as origins)
+                bbox_min = self.scene_bbox_min.to(origins_nh.dtype)
+                bbox_max = self.scene_bbox_max.to(origins_nh.dtype)
+
                 t_exit = _ray_box_exit_distance(
-                    origins_nh, dirs_nh,
-                    self.scene_bbox_min, self.scene_bbox_max,
-                    default_dist)
-                next_origins[no_hit_mask] = origins_nh + \
-                                            dirs_nh * t_exit.unsqueeze(-1)
+                    origins_nh, dirs_nh, bbox_min, bbox_max, default_dist)
+
+                # Ensure t_exit is at least a meaningful distance
+                # This prevents escaped rays from collapsing to a single
+                # point in nearly-flat scenes (e.g., single flat interface),
+                # which would break downstream position-based analysis.
+                min_t = max(0.05 * self.scene_diag, 1e-2)
+                t_exit = torch.clamp(t_exit, min=min_t)
+
+                escape_origins = origins_nh + dirs_nh * t_exit.unsqueeze(-1)
+                # Explicitly cast back to next_origins dtype
+                next_origins[no_hit_mask] = escape_origins.to(next_origins.dtype)
                 active_mask[no_hit_mask] = False
 
             # ---------- 6. Update ----------
