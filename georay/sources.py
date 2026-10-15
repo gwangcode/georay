@@ -21,7 +21,8 @@ def generate_rays(source_type="grid", num_rays=100, origin=(0, 0, 0),
         radius: disk radius for "random" source.
         angle_deg: cone half-angle for "point_source".
         bounds: (xmin, xmax, ymin, ymax) offset range for "grid"/"area_source".
-                ★ 注意：这是相对于 origin 的偏移，不是绝对坐标。
+                Note: This is an OFFSET relative to origin, not absolute
+                coordinates.
         mesh: trimesh.Trimesh for "mesh_source".
         polarization: "s" | "p" | "random" | angle in degrees.
         wavelength_nm: wavelength in nanometers.
@@ -37,7 +38,7 @@ def generate_rays(source_type="grid", num_rays=100, origin=(0, 0, 0),
     Raises:
         InvalidRayError: if inputs are inconsistent.
     """
-    # ---- 输入验证 ----
+    # ---- Input validation ----
     if num_rays <= 0:
         raise InvalidRayError(
             "num_rays must be > 0, got {}".format(num_rays))
@@ -58,7 +59,7 @@ def generate_rays(source_type="grid", num_rays=100, origin=(0, 0, 0),
             "polarization must be 's', 'p', 'random', or an angle in degrees. "
             "Got '{}'".format(polarization))
 
-    # ---- 归一化主方向 ----
+    # ---- Normalize main direction ----
     main_dir = torch.tensor(direction, dtype=torch.float32, device=device)
     dir_norm = torch.norm(main_dir)
     if dir_norm < 1e-12:
@@ -74,7 +75,7 @@ def generate_rays(source_type="grid", num_rays=100, origin=(0, 0, 0),
     u_vec = u_vec / torch.norm(u_vec)
     v_vec = torch.cross(main_dir, u_vec, dim=-1)
 
-    # ---- 按类型生成 ----
+    # ---- Generate by source type ----
     if source_type == "grid":
         side_len = int(math.sqrt(num_rays))
         if side_len < 1:
@@ -191,7 +192,7 @@ def generate_rays(source_type="grid", num_rays=100, origin=(0, 0, 0),
     s_ref = _choose_perpendicular(dirs)
     p_ref = torch.cross(dirs, s_ref, dim=-1)
 
-    # ---- medium_ids ----
+    # ---- Build medium_ids tensor ----
     if isinstance(medium_id, (list, tuple)):
         if len(medium_id) != num_rays:
             raise InvalidRayError(
