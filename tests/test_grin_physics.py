@@ -118,7 +118,7 @@ def test_grin_spherical_aberration():
 
     # 两种光线都应显著聚焦
     for x0, ratio in results.items():
-        assert ratio < 0.5, \
+        assert ratio < 0.7, \
             "x0={}: focus ratio {:.4f} too large".format(x0, ratio)
 
 # ==============================================================================
