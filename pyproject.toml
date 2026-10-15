@@ -29,35 +29,32 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Visualization",
 ]
 
-# ---- 核心依赖（最小集） ----
+# ---- Core dependencies ----
 dependencies = [
     "numpy>=1.21",
     "torch>=2.0",
+    "trimesh>=3.20",
 ]
 
-# ---- 可选依赖 ----
+# ---- Optional dependencies ----
 [project.optional-dependencies]
-# 网格 I/O（NPZ/STL 导出、trimesh 网格加载）
-io = ["trimesh>=3.20"]
-
-# Warp GPU 加速（全内核 tracer，推荐）
+# Warp GPU acceleration (full-kernel tracer, recommended)
 warp = ["warp-lang>=1.0"]
 
-# STEP 网格适配（依赖 stepmesh）
-step = ["trimesh>=3.20", "stepmesh"]
+# STEP mesh adapter (CAD file support)
+step = ["stepmesh @ git+https://github.com/gwangcode/stepmesh"]
 
-# 一次性装齐所有可选依赖
+# Everything in one go
 all = [
-    "trimesh>=3.20",
     "warp-lang>=1.0",
+    "stepmesh @ git+https://github.com/gwangcode/stepmesh",
 ]
 
-# 开发工具
+# Development tools
 dev = [
     "pytest>=7.0",
     "pytest-cov>=4.0",
     "ruff>=0.4",
-    "trimesh>=3.20",
 ]
 
 [project.urls]
@@ -66,7 +63,7 @@ Repository = "https://github.com/gwangcode/georay"
 Issues = "https://github.com/gwangcode/georay/issues"
 
 # ==============================================================================
-# 构建
+# Build
 # ==============================================================================
 
 [tool.hatch.build.targets.wheel]
@@ -95,7 +92,6 @@ markers = [
     "gpu: tests that require a CUDA GPU",
     "slow: tests that take more than 5 seconds",
     "warp: tests that require warp-lang",
-    "io: tests that require trimesh",
 ]
 
 # ==============================================================================
