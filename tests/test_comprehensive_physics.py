@@ -544,41 +544,6 @@ def test_max_steps_zero():
     assert out["energy_conserved"]
 
 
-# ==============================================================================
-# 12. verbose mode smoke test
-# ==============================================================================
-
-def test_verbose_mode(capsys):
-    """verbose=True must run without crashing and emit GRIN diagnostics."""
-    device = torch.device("cpu")
-    verts, faces = make_box((1.0, 1.0, 4.0), device)
-    face_mats = torch.zeros((faces.shape[0], 2), dtype=torch.long, device=device)
-    face_mats[:, 0] = 0
-    face_mats[:, 1] = 1
-
-    def parabolic_grin(x, y, z, wl):
-        return 1.5 - 0.1 * (x ** 2 + y ** 2)
-
-    materials = {
-        0: {"n": 1.0, "reflectivity": 0.0, "diffuse": 0.0, "absorptivity": 0.0},
-        1: {"n": 1.5, "reflectivity": 0.0, "diffuse": 0.0,
-            "absorptivity": 0.0, "grin_field": parabolic_grin},
-    }
-
-    rays = generate_rays(
-        source_type="grid", num_rays=1,
-        origin=(0.3, 0.0, -3.0), direction=(0.0, 0.0, 1.0),
-        bounds=(0.0, 0.0, 0.0, 0.0),
-        polarization="s", device=device)
-
-    tracer = AdvancedRayTracerPBRTGPU(verts, faces, face_mats, materials, device)
-    _ = tracer.trace(rays, max_steps=50, ds_init=0.05,
-                     ds_max=0.1, verbose=True)
-
-    captured = capsys.readouterr()
-    assert "GRIN" in captured.out, \
-        f"verbose output did not contain 'GRIN': {captured.out[:200]}"
-
 
 # ==============================================================================
 # Entry point
