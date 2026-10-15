@@ -1,27 +1,27 @@
 # georay/warp_tracer.py
 """
-全 Warp 内核实现的 GeoRay tracer（callable GRIN 支持版）。
+Full Warp-kernel implementation of the GeoRay tracer.
 
-支持：
-    * Fresnel (s/p 偏振加权) + TIR
-    * Stokes 偏振追踪（Jones-Mueller + 基准旋转）
-    * Monte Carlo 分支（reflect / refract / diffuse / absorb）
-    * 能量权重累积
-    * Diffuse 半球采样
+Supports:
+    * Fresnel (s/p polarization-weighted) + TIR
+    * Stokes polarization tracking (Jones-Mueller + reference rotation)
+    * Monte Carlo branching (reflect / refract / diffuse / absorb)
+    * Energy weight accumulation
+    * Diffuse hemisphere sampling
     * surface_model: "fresnel" / "custom" / "coated"
 
-属性 LUT（n / reflectivity / diffuse / absorptivity）：
-    * kind=0: 标量常量
-    * kind=1: 1D 波长 LUT
-    * kind=2: 2D 波长×角度 LUT
+Property LUT (n / reflectivity / diffuse / absorptivity):
+    * kind=0: scalar constant
+    * kind=1: 1D wavelength LUT
+    * kind=2: 2D wavelength x angle LUT
     * kind=3: 3D GRIN LUT
-    * kind=4: 4D GRIN+波长 LUT
+    * kind=4: 4D GRIN + wavelength LUT
 
-GRIN 场：
-    * parabolic 内置 RK4
-    * callable Python 函数 → 自动采样为 3D grid → 走 grid 路径
-    * 3D dict-grid  三线性插值 + 解析梯度
-    * 4D dict-grid  四线性插值 + 中心差分梯度
+GRIN fields:
+    * parabolic: built-in RK4
+    * callable Python function -> auto-sampled to 3D grid -> grid path
+    * 3D dict-grid: trilinear interpolation + analytic gradient
+    * 4D dict-grid: quadrilinear interpolation + central-difference gradient
 """
 
 from __future__ import annotations
@@ -36,7 +36,7 @@ from .tracer import _validate_materials_cfg, _validate_ray_dict
 
 
 # ==============================================================================
-# 基础设备函数
+# Basic device functions
 # ==============================================================================
 
 @wp.func
@@ -92,7 +92,7 @@ def rotate_stokes_to_new_s(
 
 
 # ==============================================================================
-# LUT 插值函数
+# LUT interpolation functions
 # ==============================================================================
 
 @wp.func
@@ -564,13 +564,11 @@ def ray_box_exit_distance(
     bbox_max: wp.vec3,
     default_dist: wp.float32,
 ) -> wp.float32:
-    """Slab method: 光线与 AABB 的远交点距离（t_far）。
-
-    如果光线完全不穿过 bbox，返回 default_dist。
-    """
+    """Slab method: ray-AABB far intersection distance (t_far). Returns default_dist if the ray does not intersect the bbox."""
+   
     eps = wp.float32(1e-12)
 
-    # 防止除零
+    # Prevent division by zero
     safe_dx = wp.where(wp.abs(d[0]) < eps,
                        wp.where(d[0] >= 0.0, eps, -eps), d[0])
     safe_dy = wp.where(wp.abs(d[1]) < eps,
@@ -581,7 +579,7 @@ def ray_box_exit_distance(
     inv_dy = 1.0 / safe_dy
     inv_dz = 1.0 / safe_dz
 
-    # slab 交点
+    # slab intersection points
     t1x = (bbox_min[0] - origin[0]) * inv_dx
     t2x = (bbox_max[0] - origin[0]) * inv_dx
     t1y = (bbox_min[1] - origin[1]) * inv_dy
@@ -599,7 +597,7 @@ def ray_box_exit_distance(
     t_near = wp.max(wp.max(t_near_x, t_near_y), t_near_z)
     t_far = wp.min(wp.min(t_far_x, t_far_y), t_far_z)
 
-    # 有效性：t_far >= max(t_near, 0)
+    # Validity：t_far >= max(t_near, 0)
     valid = (t_far >= wp.max(t_near, 0.0)) and (t_far >= 0.0)
     if valid:
         return t_far
@@ -667,7 +665,7 @@ def eval_grin_n_and_grad(
 
 
 # ==============================================================================
-# 主内核
+# main kernel
 # ==============================================================================
 
 @wp.kernel(enable_backward=False)
@@ -1339,8 +1337,8 @@ class WarpTracer:
             indices=wp.array(faces_np, dtype=wp.int32, device=self.warp_device),
         )
         self.mesh_id = self.mesh.id
-        # ★ 场景对角线（用于逃逸光线的远场延伸）
-        # ★ 场景 bbox —— 逃逸光线终止于 bbox 边界
+                    
+        # Escaped rays terminate at the scene bbox boundary
         v_min = verts_np.min(axis=0)
         v_max = verts_np.max(axis=0)
         diag = float(np.linalg.norm(v_max - v_min))
@@ -1349,7 +1347,7 @@ class WarpTracer:
         # Match PyTorch tracer's minimum escape clamp
         self.escape_clamp = max(0.05 * self.scene_diag, 1e-2)
 
-        # bbox 加 5% padding（避免光线终点正好在边界上）
+        # Add 5% padding to bbox
         pad = 0.05 * (v_max - v_min)
         self.scene_bbox_min_np = (v_min - pad).astype(np.float32)
         self.scene_bbox_max_np = (v_max + pad).astype(np.float32)
@@ -1465,13 +1463,14 @@ class WarpTracer:
     @staticmethod
     def _sample_callable_to_grid(func, bounds, resolution, mesh_bbox):
         """
-        把 Python callable 采样成 3D grid。
+        Sample a Python callable into a 3D grid.
 
         Args:
-            func: Python 函数 f(x, y, z) -> n，支持标量或 numpy 数组。
-            bounds: (xmin, xmax, ymin, ymax, zmin, zmax) 或 None。
-            resolution: (nx, ny, nz) 采样点数。
-            mesh_bbox: (mesh_min, mesh_max) numpy 数组。
+            func: Python function f(x, y, z) -> n, supporting scalar or
+                numpy array inputs.
+            bounds: (xmin, xmax, ymin, ymax, zmin, zmax) or None.
+            resolution: (nx, ny, nz) number of sample points per axis.
+            mesh_bbox: (mesh_min, mesh_max) numpy arrays.
 
         Returns:
             (x_nodes, y_nodes, z_nodes, values)
@@ -1566,11 +1565,10 @@ class WarpTracer:
         stokes = ray_dict["stokes"].to(self.device).contiguous().float()
         wavelengths = ray_dict["wavelengths"].to(self.device).contiguous().float().squeeze(-1)
 
-        # ★ N 必须在 medium_ids 处理之前定义
         N = origins.shape[0]
         S = max_steps + 1
 
-        # ★ 支持 ray_dict["medium_ids"]：每条光线的初始介质
+        
         if "medium_ids" in ray_dict:
             mid = ray_dict["medium_ids"]
             if isinstance(mid, int):
@@ -1585,6 +1583,7 @@ class WarpTracer:
                             medium_ids_t.shape[0], N))
         else:
             medium_ids_t = torch.zeros(N, dtype=torch.int32, device=self.device)
+           
         wp_medium_ids = wp.from_torch(medium_ids_t, dtype=wp.int32)
 
         wp_origins = wp.from_torch(origins, dtype=wp.vec3)
