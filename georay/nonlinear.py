@@ -3,21 +3,21 @@ import numpy as np
 
 
 def kerr_index(n0, n2, intensity):
-    """Kerr 非线性折射率：n(I) = n0 + n2·I。"""
+    """Kerr nonlinear refractive index: n(I) = n0 + n2 * I."""
     return n0 + n2 * intensity
 
 
 def self_focusing_critical_power(wavelength_nm, n0, n2):
     """
-    Kerr 自聚焦临界功率：P_cr = 3.77·λ² / (8π·n0·n2)
+    Kerr self-focusing critical power: P_cr = 3.77 * lambda^2 / (8*pi*n0*n2).
 
     Args:
-        wavelength_nm: 波长 (nm)
-        n0: 线性折射率
-        n2: 非线性折射率 (m²/W)
+        wavelength_nm: wavelength (nm).
+        n0: linear refractive index.
+        n2: nonlinear refractive index (m^2/W).
 
     Returns:
-        P_cr (W)
+        P_cr (W).
     """
     lam_m = wavelength_nm * 1e-9
     return 3.77 * lam_m ** 2 / (8.0 * np.pi * n0 * n2)
