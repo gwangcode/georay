@@ -72,7 +72,7 @@ class BVH:
     def ray_cast(self, ray_origins, ray_dirs, allowed_face_mask=None, eps=1e-4):
         N = ray_origins.shape[0]
 
-        # ★ 空 BVH：所有光线 miss
+        # Empty BVH: all rays miss
         if self.num_faces == 0:
             min_hit_t = torch.full((N,), float('inf'), device=self.device)
             hit_face_idx = torch.full((N,), -1, dtype=torch.long, device=self.device)
