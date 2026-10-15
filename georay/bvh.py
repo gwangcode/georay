@@ -216,8 +216,7 @@ class BVHMeshIntersector:
         self.vertices = vertices.to(dtype=torch.float32, device=device)
         self.faces = faces.to(dtype=torch.long, device=device)
         self.num_faces = faces.shape[0]
-
-        # ★ 空网格：不做 BVH 构建
+        
         if self.num_faces == 0:
             self.triangles = torch.zeros((0, 3, 3), dtype=torch.float32,
                                           device=device)
@@ -237,7 +236,7 @@ class BVHMeshIntersector:
                   allowed_face_mask=None, eps=1e-4):
         N = ray_origins.shape[0]
 
-        # ★ 空网格：所有光线 miss
+        
         if self.num_faces == 0 or self.bvh is None:
             hit_dist = torch.full((N,), float('inf'),
                                    dtype=torch.float32, device=self.device)
