@@ -1,20 +1,20 @@
 """
 examples/demo_stepmesh2.py
 ==================================
-使用 stepmesh.glue() 处理 cone.step / cube.step / cylinder.step，
-用 GeoRay 追踪 10 条光线，导出 STL 供 FreeCAD 可视化。
+Process cone.step / cube.step / cylinder.step with stepmesh.glue().
+Trace 10 rays with GeoRay and export STL for FreeCAD visualization.
 
-前置安装：
+Prerequisites:
     pip install git+https://github.com/gwangcode/stepmesh
     pip install git+https://github.com/gwangcode/georay
 
-运行：
+Run:
     cd georay/examples
-    python demo_three_step_files.py
+    python demo_stepmesh2.py
 
-输出：
-    ray_tracks.stl   -- 光线轨迹
-    scene.stl        -- 场景几何
+Outputs:
+    ray_tracks.stl   -- ray trajectories
+    scene.stl        -- scene geometry
 """
 import os
 import numpy as np
@@ -25,7 +25,7 @@ try:
     from stepmesh import glue
 except ImportError:
     raise ImportError(
-        "请先安装 stepmesh:\n"
+        "Please install stepmesh first:\n"
         "    pip install git+https://github.com/gwangcode/stepmesh")
 
 from georay import AdvancedRayTracerPBRTGPU
@@ -33,7 +33,7 @@ from georay.stepmesh_adapter import glue_to_georay
 from georay.io import export_ray_history_to_stl
 
 import georay
-print("[DEBUG] georay 包位置:", georay.__file__)
+print("[DEBUG] georay package location:", georay.__file__)
 
 
 EXAMPLES_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -44,19 +44,19 @@ STEP_FILES = [
 ]
 
 print("=" * 70)
-print("GeoRay × stepmesh 演示：三个 STEP 文件的光线追踪")
+print("GeoRay x stepmesh demo: ray tracing through three STEP files")
 print("=" * 70)
 
 for f in STEP_FILES:
-    assert os.path.exists(f), "找不到 STEP 文件: {}".format(f)
+    assert os.path.exists(f), "STEP file not found: {}".format(f)
     print("  [OK] {}".format(os.path.basename(f)))
 
 
 # ==============================================================================
-# 1. 调用 stepmesh.glue() 处理 STEP 文件
+# 1. Call stepmesh.glue() to process STEP files
 # ==============================================================================
 
-print("\n[1/6] 调用 stepmesh.glue() 处理 STEP 文件...")
+print("\n[1/6] Calling stepmesh.glue() to process STEP files...")
 
 try:
     result = glue(STEP_FILES)
@@ -85,14 +85,14 @@ print("  mapping_table shape: {}".format(mapping_table.shape))
 
 
 # ==============================================================================
-# 2. 建立 体积ID → 材料ID 映射
+# 2. Build volume ID -> material ID mapping
 # ==============================================================================
 
-print("\n[2/6] 建立体积ID → 材料ID 映射...")
+print("\n[2/6] Building volume ID -> material ID mapping...")
 
 all_vols = sorted(set(mapping_table[:, 0].tolist()) |
                   set(mapping_table[:, 1].tolist()))
-print("  所有 volume IDs: {}".format(all_vols))
+print("  All volume IDs: {}".format(all_vols))
 
 vol_to_material = {0: 0}
 object_materials = [1, 2, 3]
@@ -104,10 +104,10 @@ print("  vol_to_material = {}".format(vol_to_material))
 
 
 # ==============================================================================
-# 3. 转换为 GeoRay 张量
+# 3. Convert to GeoRay tensors
 # ==============================================================================
 
-print("\n[3/6] 转换为 GeoRay 张量...")
+print("\n[3/6] Converting to GeoRay tensors...")
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print("  device = {}".format(device))
@@ -125,10 +125,10 @@ verts_t, faces_t, face_mats_t = glue_to_georay(
 
 
 # ==============================================================================
-# 4. 材料 + 生成 10 条光线
+# 4. Materials + generate 10 rays
 # ==============================================================================
 
-print("\n[4/6] 配置材料 + 生成 10 条光线...")
+print("\n[4/6] Configuring materials + generating 10 rays...")
 
 materials_cfg = {
     0: {"n": 1.00, "reflectivity": 1.0, "diffuse": 0.0, "absorptivity": 0.0},
@@ -143,10 +143,10 @@ bbox_max = v_np.max(axis=0)
 bbox_center = 0.5 * (bbox_min + bbox_max)
 bbox_size = bbox_max - bbox_min
 
-print("  场景 bbox: min = {}".format(np.round(bbox_min, 3).tolist()))
-print("             max = {}".format(np.round(bbox_max, 3).tolist()))
-print("  场景中心:   {}".format(np.round(bbox_center, 3).tolist()))
-print("  场景尺寸:   {}".format(np.round(bbox_size, 3).tolist()))
+print("  scene bbox: min = {}".format(np.round(bbox_min, 3).tolist()))
+print("              max = {}".format(np.round(bbox_max, 3).tolist()))
+print("  scene center:   {}".format(np.round(bbox_center, 3).tolist()))
+print("  scene size:     {}".format(np.round(bbox_size, 3).tolist()))
 
 N_RAYS = 10
 nx, ny = 2, 5
@@ -185,17 +185,17 @@ rays = {
     "medium_ids": torch.zeros(N_RAYS, dtype=torch.long, device=device),
 }
 
-print("  生成 {} 条光线".format(N_RAYS))
-print("  x 范围: [{:.3f}, {:.3f}]".format(x_lin[0], x_lin[-1]))
-print("  y 范围: [{:.3f}, {:.3f}]".format(y_lin[0], y_lin[-1]))
-print("  z 起点: {:.3f}".format(z_start))
+print("  Generated {} rays".format(N_RAYS))
+print("  x range: [{:.3f}, {:.3f}]".format(x_lin[0], x_lin[-1]))
+print("  y range: [{:.3f}, {:.3f}]".format(y_lin[0], y_lin[-1]))
+print("  z start: {:.3f}".format(z_start))
 
 
 # ==============================================================================
-# 5. 追踪
+# 5. Trace
 # ==============================================================================
 
-print("\n[5/6] 执行光线追踪...")
+print("\n[5/6] Running ray tracing...")
 
 tracer = AdvancedRayTracerPBRTGPU(
     verts_t, faces_t, face_mats_t, materials_cfg, device)
@@ -214,17 +214,17 @@ print("  positions shape:  {}".format(tuple(out["positions"].shape)))
 print("  active  shape:    {}".format(tuple(out["active"].shape)))
 print("  energy_conserved: {}".format(out["energy_conserved"]))
 
-# 打印每条光线的命中情况
-print("\n  每条光线的命中情况：")
+# Print per-ray hit status
+print("\n  Per-ray hit status:")
 for i in range(N_RAYS):
     valid_len = int(out["active"][i].sum().item()) + 1
     final_pos = out["positions"][i, valid_len - 1].cpu().numpy()
-    print("    Ray {:2d}: {} 步, 终止于 {}".format(
+    print("    Ray {:2d}: {} steps, terminated at {}".format(
         i, valid_len - 1, np.round(final_pos, 3).tolist()))
 
 
-# ★ 诊断：打印每条光线的每段长度
-print("\n  每条光线的每段长度（诊断）：")
+# Diagnostic: print each ray's segment lengths
+print("\n  Segment lengths per ray (diagnostic):")
 positions = out["positions"].cpu().numpy()
 active = out["active"].cpu().numpy()
 for i in range(N_RAYS):
@@ -234,22 +234,22 @@ for i in range(N_RAYS):
         seg = positions[i, j + 1] - positions[i, j]
         L = float(np.linalg.norm(seg))
         seg_lengths.append(L)
-    print("    Ray {:2d}: {} 段, 各段长度 = {}".format(
+    print("    Ray {:2d}: {} segments, lengths = {}".format(
         i, len(seg_lengths),
         [round(L, 2) for L in seg_lengths]))
 
 
 # ==============================================================================
-# 6. 导出 STL
+# 6. Export STL
 # ==============================================================================
 
-print("\n[6/6] 导出光线轨迹 STL...")
+print("\n[6/6] Exporting ray track STL...")
 
 output_stl = os.path.join(EXAMPLES_DIR, "ray_tracks.stl")
 
-# 半径 = bbox_max 的 0.002（原 0.008 的 1/4）
+# Radius = 0.002 * bbox_max (1/4 of the previous 0.008)
 ray_radius = 0.002 * float(bbox_size.max())
-print("  光线半径: {:.4f}".format(ray_radius))
+print("  Ray radius: {:.4f}".format(ray_radius))
 
 export_ray_history_to_stl(
     out,
@@ -257,9 +257,9 @@ export_ray_history_to_stl(
     radius=ray_radius,
     sides=6,
 )
-print("  光线 STL: {}".format(output_stl))
+print("  Ray STL: {}".format(output_stl))
 
-# 场景 STL
+# Scene STL
 try:
     scene_stl = os.path.join(EXAMPLES_DIR, "scene.stl")
     scene_mesh = trimesh.Trimesh(
@@ -267,24 +267,24 @@ try:
         faces=faces_t.detach().cpu().numpy(),
     )
     scene_mesh.export(scene_stl)
-    print("  场景 STL: {}".format(scene_stl))
+    print("  Scene STL: {}".format(scene_stl))
 except Exception as e:
-    print("  场景 STL 导出失败: {}".format(e))
+    print("  Scene STL export failed: {}".format(e))
 
 
 # ==============================================================================
-# 7. 汇总
+# 7. Summary
 # ==============================================================================
 
 print("\n" + "=" * 70)
-print("完成")
+print("Done")
 print("=" * 70)
-print("  ray_tracks.stl  -- {} 条光线轨迹".format(N_RAYS))
-print("  scene.stl       -- 场景几何")
+print("  ray_tracks.stl  -- {} ray trajectories".format(N_RAYS))
+print("  scene.stl       -- scene geometry")
 print()
-print("  在 FreeCAD 中：")
-print("    1. 打开 Part 工作台")
-print("    2. File → Open → ray_tracks.stl")
-print("    3. File → Open → scene.stl")
-print("    4. View → Draw Style → Shaded")
+print("  In FreeCAD:")
+print("    1. Switch to the Part workbench")
+print("    2. File -> Open -> ray_tracks.stl")
+print("    3. File -> Open -> scene.stl")
+print("    4. View -> Draw Style -> Shaded")
 print("=" * 70)
