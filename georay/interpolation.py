@@ -5,10 +5,10 @@ import torch
 def gpu_interp1d(x_new, x_grid, y_grid):
     """1D linear interpolation on GPU.
 
-    ★ 入口统一做 contiguous，避免 torch.searchsorted 因非连续
-      value tensor 触发性能 warning。
+    Entry point calls .contiguous() to avoid torch.searchsorted
+    performance warnings on non-contiguous value tensors.
     """
-    # ---- 输入规范化 ----
+    # ---- Input normalization ----
     x_new = x_new.contiguous()
     x_grid = x_grid.contiguous()
     y_grid = y_grid.contiguous()
@@ -28,10 +28,10 @@ def gpu_interp1d(x_new, x_grid, y_grid):
 def gpu_interp2d(x_new, y_new, x_grid, y_grid, z_grid):
     """2D bilinear interpolation on GPU.
 
-    ★ 入口统一做 contiguous，避免 torch.searchsorted 因非连续
-      value tensor 触发性能 warning。
+    Entry point calls .contiguous() to avoid torch.searchsorted
+    performance warnings on non-contiguous value tensors.
     """
-    # ---- 输入规范化 ----
+    # ---- Input normalization ----
     x_new = x_new.contiguous()
     y_new = y_new.contiguous()
     x_grid = x_grid.contiguous()
@@ -63,23 +63,30 @@ def create_pure_torch_interpolated_cfg(prop_val, device):
             x_pts = prop_val.get("wavelengths_nm", prop_val.get("x"))
             y_pts = prop_val.get("cos_theta", prop_val.get("y"))
             z_pts = prop_val["values"]
-            x_grid = torch.tensor(x_pts, dtype=torch.float32, device=device).contiguous()
-            y_grid = torch.tensor(y_pts, dtype=torch.float32, device=device).contiguous()
-            z_grid = torch.tensor(z_pts, dtype=torch.float32, device=device).contiguous()
+            x_grid = torch.tensor(x_pts, dtype=torch.float32,
+                                   device=device).contiguous()
+            y_grid = torch.tensor(y_pts, dtype=torch.float32,
+                                   device=device).contiguous()
+            z_grid = torch.tensor(z_pts, dtype=torch.float32,
+                                   device=device).contiguous()
             return lambda x_in, y_in=None: (
                 gpu_interp2d(x_in, y_in, x_grid, y_grid, z_grid)
                 if y_in is not None else gpu_interp1d(x_in, x_grid, z_grid[:, 0])
             )
         else:
             x_pts = prop_val.get("wavelengths_nm",
-                                 prop_val.get("x", prop_val.get("cos_theta", [])))
+                                 prop_val.get("x",
+                                              prop_val.get("cos_theta", [])))
             y_pts = prop_val.get("values",
                                  prop_val.get("y", prop_val.get("val", [])))
-            x_tensor = torch.tensor(x_pts, dtype=torch.float32, device=device).contiguous()
-            y_tensor = torch.tensor(y_pts, dtype=torch.float32, device=device).contiguous()
+            x_tensor = torch.tensor(x_pts, dtype=torch.float32,
+                                     device=device).contiguous()
+            y_tensor = torch.tensor(y_pts, dtype=torch.float32,
+                                     device=device).contiguous()
             return lambda x_in, y_in=None: gpu_interp1d(x_in, x_tensor, y_tensor)
     elif callable(prop_val):
         return prop_val
     else:
-        val_tensor = torch.tensor(float(prop_val), dtype=torch.float32, device=device)
+        val_tensor = torch.tensor(float(prop_val), dtype=torch.float32,
+                                    device=device)
         return lambda x_in, y_in=None: val_tensor.expand_as(x_in)
