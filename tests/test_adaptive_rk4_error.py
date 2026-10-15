@@ -1,13 +1,14 @@
 """
 tests/test_adaptive_rk4_error.py
 =================================
-自适应 RK4 的误差控制验证。
+Error control validation for adaptive RK4.
 
-物理依据：
-    自适应步长算法的核心保证是每步局部误差 ≤ tol。
-    - rk_error 应记录每步的实际误差估计
-    - 拒绝步后步长应减半
-    - 接受步后步长应增大
+Physics:
+    The core guarantee of adaptive step-size algorithms is that the
+    local error per step is <= tol.
+    - rk_error should record the actual error estimate per step
+    - After a rejected step, step size should halve
+    - After an accepted step, step size should increase
 """
 import torch
 import trimesh
@@ -59,7 +60,7 @@ def test_rk4_error_below_tolerance():
 
     rk_err = out["rk_error"][0]
 
-    # 有效步（active 且位置变化）的误差
+    # Error on effective steps (active and position changed)
     pos = out["positions"][0]
     moved = (pos[1:] - pos[:-1]).norm(dim=-1) > 1e-8
 
@@ -71,11 +72,11 @@ def test_rk4_error_below_tolerance():
     print("  Max rk_error on effective steps: {:.3e}".format(
         err_effective.max().item() if len(err_effective) > 0 else 0.0))
 
-    # 大多数步（接受步）误差应 < tol
+    # Most steps (accepted) should have error < tol
     fraction_below = (err_effective < tol * 1.1).float().mean().item()
     print("  Fraction with rk_err < 1.1·tol: {:.2%}".format(fraction_below))
 
-    # 至少 80% 的步应该满足误差控制
+    # At least 80% of steps should satisfy error control
     assert fraction_below > 0.8, \
         "Only {:.2%} of steps have error below tolerance".format(fraction_below)
 
