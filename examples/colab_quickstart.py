@@ -1,25 +1,25 @@
 """
-GeoRay Colab 快速入门
-=====================
-复制粘贴到 Google Colab 单元格运行。
+GeoRay Colab Quickstart
+=======================
+Copy and paste into Google Colab cells to run.
 
-前置：开启 GPU 运行时
-    Colab 菜单 → 代码执行 → 更改运行时类型 → T4 GPU
+Prerequisites: enable GPU runtime
+    Colab menu -> Runtime -> Change runtime type -> T4 GPU
 """
 
 # ==============================================================================
-# Cell 1: 安装
+# Cell 1: Install
 # ==============================================================================
 # !pip install -q "georay[warp] @ git+https://github.com/gwangcode/georay"
 # !pip install -q trimesh
 
 # ==============================================================================
-# Cell 2: 环境检查
+# Cell 2: Environment check
 # ==============================================================================
 import torch
 import warp as wp
 
-assert torch.cuda.is_available(), "请开启 GPU 运行时！"
+assert torch.cuda.is_available(), "Please enable GPU runtime!"
 print(f"GPU:  {torch.cuda.get_device_name(0)}")
 print(f"VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
 
@@ -28,14 +28,14 @@ print(f"GeoRay version: {georay.__version__}")
 print(f"WarpTracer:     {'available' if georay.WarpTracer else 'NOT available'}")
 
 # ==============================================================================
-# Cell 3: 快速追踪示例
+# Cell 3: Quick trace example
 # ==============================================================================
 import trimesh
 from georay import WarpTracer, generate_rays
 
 device = torch.device("cuda")
 
-# 场景：玻璃立方体
+# Scene: glass cube
 cube = trimesh.creation.box(extents=[2.0, 2.0, 2.0])
 verts = torch.tensor(cube.vertices, dtype=torch.float32, device=device)
 faces = torch.tensor(cube.faces, dtype=torch.long, device=device)
@@ -47,14 +47,14 @@ materials = {
     1: {"n": 1.5, "reflectivity": 1.0, "diffuse": 0.0, "absorptivity": 0.0},
 }
 
-# 光线：从空气沿 +z 入射
+# Rays: incident from air along +z
 rays = generate_rays(
     source_type="grid", num_rays=1024,
     origin=(0.0, 0.0, -3.0), direction=(0.0, 0.0, 1.0),
     bounds=(-0.5, 0.5, -0.5, 0.5),
     polarization="s", device=device)
 
-# 追踪
+# Trace
 tracer = WarpTracer(verts, faces, fm, materials, device)
 out = tracer.trace(rays, max_steps=20, surface_model="fresnel")
 
@@ -62,48 +62,48 @@ print(f"positions:        {tuple(out['positions'].shape)}")
 print(f"energy_conserved: {out['energy_conserved']}")
 
 # ==============================================================================
-# Cell 4: 从介质内部发射光线（新功能）
+# Cell 4: Emit rays from inside a medium (new feature)
 # ==============================================================================
 from georay import generate_rays
 
-# 从玻璃内部 z=0 出发
+# Start from inside glass at z=0
 rays_inside = generate_rays(
     source_type="grid", num_rays=256,
     origin=(0.0, 0.0, 0.0), direction=(0.0, 0.0, 1.0),
     bounds=(-0.3, 0.3, -0.3, 0.3),
     polarization="s",
-    medium_id=1,          # ★ 从玻璃（material 1）内部出发
+    medium_id=1,          # Start inside glass (material 1)
     device=device)
 
 out_inside = tracer.trace(rays_inside, max_steps=10)
-print(f"从介质内部出发的追踪结果：")
+print(f"Trace result from inside a medium:")
 print(f"  energy_conserved: {out_inside['energy_conserved']}")
-print(f"  n1[step 1] = {out_inside['n1'][0, 1, 0].item():.3f}  (期望 1.5)")
+print(f"  n1[step 1] = {out_inside['n1'][0, 1, 0].item():.3f}  (expected 1.5)")
 
 # ==============================================================================
-# Cell 5: 异常处理示例
+# Cell 5: Exception handling example
 # ==============================================================================
 from georay import InvalidMaterialError, InvalidRayError
 
-# 非法材质 → 立即捕获
+# Invalid material -> caught immediately
 try:
     bad_materials = {0: {"n": -1.5}}   # n < 0
     WarpTracer(verts, faces, fm, bad_materials, device)
 except InvalidMaterialError as e:
-    print(f"✓ 捕获到 InvalidMaterialError: {e}")
+    print(f"Caught InvalidMaterialError: {e}")
 
-# 非法光线 → 立即捕获
+# Invalid ray dict -> caught immediately
 try:
     bad_rays = {
         "origins": torch.zeros((4, 3), device=device),
-        # 缺少 dirs 等字段
+        # missing 'dirs' and other required fields
     }
     tracer.trace(bad_rays)
 except InvalidRayError as e:
-    print(f"✓ 捕获到 InvalidRayError: {e}")
+    print(f"Caught InvalidRayError: {e}")
 
 # ==============================================================================
-# Cell 6: 性能基准
+# Cell 6: Performance benchmark
 # ==============================================================================
 import time
 
@@ -114,7 +114,7 @@ for N in [256, 1024, 4096, 16384]:
         bounds=(-0.5, 0.5, -0.5, 0.5),
         polarization="s", device=device)
 
-    tracer.trace(rays, max_steps=2)   # warmup
+    tracer.trace(rays, max_steps=2)   # warm-up
     torch.cuda.synchronize()
     t0 = time.perf_counter()
     tracer.trace(rays, max_steps=20)
