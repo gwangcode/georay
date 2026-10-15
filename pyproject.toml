@@ -36,21 +36,12 @@ dependencies = [
     "trimesh>=3.20",
 ]
 
-# ---- Optional dependencies ----
+# ---- Optional dependencies (pure PyPI only) ----
+# NOTE: stepmesh is installed from GitHub separately (see requirements.txt).
+#       Do NOT put git+URL entries here — they break metadata generation.
 [project.optional-dependencies]
-# Warp GPU acceleration (full-kernel tracer, recommended)
 warp = ["warp-lang>=1.0"]
-
-# STEP mesh adapter (CAD file support)
-step = ["stepmesh @ git+https://github.com/gwangcode/stepmesh"]
-
-# Everything in one go
-all = [
-    "warp-lang>=1.0",
-    "stepmesh @ git+https://github.com/gwangcode/stepmesh",
-]
-
-# Development tools
+all = ["warp-lang>=1.0"]
 dev = [
     "pytest>=7.0",
     "pytest-cov>=4.0",
