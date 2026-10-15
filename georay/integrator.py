@@ -53,7 +53,8 @@ def adaptive_rk4_step_per_ray(r, d, grin_field, wavelengths, h_per_ray,
     r_mid, d_mid, _ = rk4_step_grin(r, d, grin_field, wavelengths, h_half)
     r2, d2, n2 = rk4_step_grin(r_mid, d_mid, grin_field, wavelengths, h_half)
 
-    err = torch.maximum(torch.norm(r1 - r2, dim=-1), torch.norm(d1 - d2, dim=-1))
+    err = torch.maximum(torch.norm(r1 - r2, dim=-1),
+                        torch.norm(d1 - d2, dim=-1))
     accepted = err < tol
     at_h_min = h_per_ray <= (h_min * 1.05)
     force_accept = (~accepted) & at_h_min
@@ -63,7 +64,8 @@ def adaptive_rk4_step_per_ray(r, d, grin_field, wavelengths, h_per_ray,
     r_next = torch.where(acc_3d, r2, r)
     d_next = torch.where(acc_3d, d2, d)
 
-    # ★ 修复：删掉 no_grad（CustomFunctionGRINField 内部用 autograd.grad）
+    # Note: do NOT use torch.no_grad() here — CustomFunctionGRINField
+    # internally uses autograd.grad, which requires grad tracking.
     n_curr_tmp, _ = grin_field(r, wavelengths)
     n_next = torch.where(acc_3d, n2, n_curr_tmp)
 
