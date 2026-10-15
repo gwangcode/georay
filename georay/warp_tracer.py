@@ -721,6 +721,7 @@ def trace_kernel(
     far_escape: wp.float32,
     scene_bbox_min: wp.vec3,
     scene_bbox_max: wp.vec3,
+    escape_clamp: wp.float32,
     seed: wp.int32,
     surface_model_flag: wp.int32,
     ds_init: wp.float32,
@@ -885,15 +886,12 @@ def trace_kernel(
             cur_n2 = wp.float32(1.0)
 
             if not q.result:
-                # ★ 逃逸光线终止于场景 bbox 边界
-                default_dist = 2.0 * far_escape / 100.0  # 用 scene_diag 的 2 倍
-                # 注意：far_escape 在 __init__ 里设为 100*scene_diag
-                # 所以 far_escape/100 = scene_diag
+                default_dist = 2.0 * (far_escape / 100.0)
                 t_exit = ray_box_exit_distance(
                     origin, d, scene_bbox_min, scene_bbox_max,
                     default_dist)
-                # 光线至少走一点点，避免 t_exit = 0
-                t_exit = wp.max(t_exit, wp.float32(0.1))
+                # Use the same clamp as PyTorch tracer
+                t_exit = wp.max(t_exit, escape_clamp)
                 origin = origin + d * t_exit
                 active = wp.int32(0)
             else:
@@ -1347,8 +1345,9 @@ class WarpTracer:
         v_max = verts_np.max(axis=0)
         diag = float(np.linalg.norm(v_max - v_min))
         self.scene_diag = diag if diag > 1e-6 else 1.0
-        # far_escape 保留（用于传给 kernel 作为兜底），但实际用 bbox 边界
         self.far_escape = max(100.0 * self.scene_diag, 1e5)
+        # Match PyTorch tracer's minimum escape clamp
+        self.escape_clamp = max(0.05 * self.scene_diag, 1e-2)
 
         # bbox 加 5% padding（避免光线终点正好在边界上）
         pad = 0.05 * (v_max - v_min)
@@ -1630,6 +1629,7 @@ class WarpTracer:
                 np.float32(self.far_escape),
                 wp.vec3(*self.scene_bbox_min_np.tolist()),
                 wp.vec3(*self.scene_bbox_max_np.tolist()),
+                np.float32(self.escape_clamp),
                 int(seed),
                 int(surface_model_flag),
                 np.float32(ds_init),
