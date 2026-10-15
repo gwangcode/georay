@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "georay"
-version = "1.1.0"
+version = "1.2.0"
 description = "A GPU-Accelerated Ray Tracer for GRIN and Polarization Optics"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -13,15 +13,8 @@ authors = [
     { name = "Gang Wang" },
 ]
 keywords = [
-    "ray-tracing",
-    "optics",
-    "GRIN",
-    "polarization",
-    "fresnel",
-    "stokes",
-    "GPU",
-    "pytorch",
-    "warp",
+    "ray-tracing", "optics", "GRIN", "polarization",
+    "fresnel", "stokes", "GPU", "pytorch", "warp",
 ]
 classifiers = [
     "Development Status :: 4 - Beta",
@@ -36,50 +29,44 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Visualization",
 ]
 
-# ---- 核心依赖 ----
+# ---- 核心依赖（最小集） ----
 dependencies = [
     "numpy>=1.21",
     "torch>=2.0",
-    "trimesh>=3.20",
 ]
 
 # ---- 可选依赖 ----
 [project.optional-dependencies]
-# Warp 加速（全 GPU 内核 tracer）
+# 网格 I/O（NPZ/STL 导出、trimesh 网格加载）
+io = ["trimesh>=3.20"]
+
+# Warp GPU 加速（全内核 tracer，推荐）
 warp = ["warp-lang>=1.0"]
-# OptiX 硬件光追（需要 OptiX SDK，暂未启用）
-# optix = ["torchoptix>=0.1"]
+
+# STEP 网格适配（依赖 stepmesh）
+step = ["trimesh>=3.20", "stepmesh"]
+
+# 一次性装齐所有可选依赖
+all = [
+    "trimesh>=3.20",
+    "warp-lang>=1.0",
+]
+
 # 开发工具
 dev = [
     "pytest>=7.0",
     "pytest-cov>=4.0",
     "ruff>=0.4",
-]
-# 文档
-docs = [
-    "sphinx>=7.0",
-    "sphinx-rtd-theme>=2.0",
-    "myst-parser>=2.0",
-]
-# 全部可选依赖
-all = [
-    "warp-lang>=1.0",
-    "pytest>=7.0",
-    "pytest-cov>=4.0",
+    "trimesh>=3.20",
 ]
 
 [project.urls]
 Homepage = "https://github.com/gwangcode/georay"
 Repository = "https://github.com/gwangcode/georay"
 Issues = "https://github.com/gwangcode/georay/issues"
-Changelog = "https://github.com/gwangcode/georay/blob/main/CHANGELOG.md"
-
-[project.scripts]
-# 可选：命令行入口（如果有 CLI 工具）
-# georay-demo = "georay.cli:main"
 
 # ==============================================================================
-# 构建配置
+# 构建
 # ==============================================================================
 
 [tool.hatch.build.targets.wheel]
@@ -92,112 +79,39 @@ include = [
     "/examples",
     "/README.md",
     "/LICENSE",
-    "/CITATION.cff",
     "/pyproject.toml",
-]
-exclude = [
-    "**/__pycache__",
-    "**/*.pyc",
-    "**/.pytest_cache",
-    "**/.ruff_cache",
 ]
 
 # ==============================================================================
-# pytest 配置
+# pytest
 # ==============================================================================
 
 [tool.pytest.ini_options]
 minversion = "7.0"
 testpaths = ["tests"]
 python_files = ["test_*.py"]
-python_classes = ["Test*"]
-python_functions = ["test_*"]
-addopts = [
-    "-v",
-    "--tb=short",
-    "--strict-markers",
-    "--strict-config",
-]
+addopts = ["-v", "--tb=short", "--strict-markers"]
 markers = [
     "gpu: tests that require a CUDA GPU",
     "slow: tests that take more than 5 seconds",
     "warp: tests that require warp-lang",
-    "optix: tests that require OptiX SDK",
-]
-filterwarnings = [
-    "ignore::DeprecationWarning:trimesh.*",
-    "ignore::UserWarning:torch.*",
+    "io: tests that require trimesh",
 ]
 
 # ==============================================================================
-# ruff 配置（linter + formatter）
+# ruff
 # ==============================================================================
 
 [tool.ruff]
 line-length = 100
 target-version = "py39"
-exclude = [
-    ".git",
-    ".venv",
-    "build",
-    "dist",
-    "__pycache__",
-    ".pytest_cache",
-    ".ruff_cache",
-]
+exclude = [".git", ".venv", "build", "dist", "__pycache__", ".pytest_cache"]
 
 [tool.ruff.lint]
-select = [
-    "E",    # pycodestyle errors
-    "W",    # pycodestyle warnings
-    "F",    # pyflakes
-    "I",    # isort
-    "B",    # flake8-bugbear
-    "C4",   # flake8-comprehensions
-    "UP",   # pyupgrade
-    "N",    # pep8-naming
-]
-ignore = [
-    "E501",   # line too long (由 line-length 处理)
-    "B008",   # function call in default argument
-    "N806",   # 变量名大写 (矩阵 M, N)
-    "N803",   # 参数名大写 (矩阵 A, B)
-]
+select = ["E", "W", "F", "I", "B", "C4", "UP"]
+ignore = ["E501", "B008", "N806", "N803"]
 
 [tool.ruff.lint.per-file-ignores]
-"tests/*" = ["B011", "B018"]        # 允许 assert False 等
-"examples/*" = ["E402", "F401"]     # 允许延迟导入
+"tests/*" = ["B011"]
+"examples/*" = ["E402", "F401"]
 "georay/warp_tracer.py" = ["N803", "N806"]
-
-[tool.ruff.lint.isort]
-known-first-party = ["georay"]
-lines-after-imports = 2
-
-[tool.ruff.format]
-quote-style = "double"
-indent-style = "space"
-line-ending = "auto"
-
-# ==============================================================================
-# coverage 配置
-# ==============================================================================
-
-[tool.coverage.run]
-source = ["georay"]
-omit = [
-    "*/tests/*",
-    "*/examples/*",
-    "*/__pycache__/*",
-    "georay/warp_tracer.py",   # Warp 内核无法被 coverage 追踪
-]
-
-[tool.coverage.report]
-exclude_lines = [
-    "pragma: no cover",
-    "def __repr__",
-    "if __name__ == .__main__.:",
-    "raise NotImplementedError",
-    "if TYPE_CHECKING:",
-]
-show_missing = true
-skip_covered = false

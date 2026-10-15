@@ -2,6 +2,7 @@
 import math
 import torch
 
+from .exceptions import InvalidRayError
 from .polarization import _choose_perpendicular
 
 
@@ -13,37 +14,72 @@ def generate_rays(source_type="grid", num_rays=100, origin=(0, 0, 0),
     """Generate rays of various source types.
 
     Args:
-        source_type: "grid", "random", "point_source", "area_source", or "mesh_source".
-        num_rays: number of rays (rounded to square for grid).
+        source_type: "grid" | "random" | "point_source" | "area_source" | "mesh_source"
+        num_rays: number of rays. For "grid", rounded down to a perfect square.
         origin: source center (x, y, z).
-        direction: main propagation direction.
-        radius: radius for random source.
-        angle_deg: cone half-angle for point_source.
-        bounds: (xmin, xmax, ymin, ymax) for grid/area_source.
-        mesh: trimesh.Trimesh for mesh_source.
-        polarization: "s", "p", "random", or angle in degrees.
+        direction: main propagation direction (normalized internally).
+        radius: disk radius for "random" source.
+        angle_deg: cone half-angle for "point_source".
+        bounds: (xmin, xmax, ymin, ymax) offset range for "grid"/"area_source".
+                ★ 注意：这是相对于 origin 的偏移，不是绝对坐标。
+        mesh: trimesh.Trimesh for "mesh_source".
+        polarization: "s" | "p" | "random" | angle in degrees.
         wavelength_nm: wavelength in nanometers.
         device: torch device.
-        medium_id: initial medium ID for all rays (default 0 = air/vacuum).
-            Set to a non-zero value for rays starting inside a dielectric
-            or GRIN medium.
+        medium_id: initial medium ID for all rays. Default 0 = air/vacuum.
+                   Set to a non-zero value for rays starting inside a dielectric
+                   or GRIN medium. Can also be a list of length num_rays.
 
     Returns:
         dict with keys: origins, dirs, wavelengths, stokes, s_ref, p_ref,
                         ray_ids, medium_ids.
+
+    Raises:
+        InvalidRayError: if inputs are inconsistent.
     """
+    # ---- 输入验证 ----
+    if num_rays <= 0:
+        raise InvalidRayError(
+            "num_rays must be > 0, got {}".format(num_rays))
+
+    if source_type not in ("grid", "random", "point_source",
+                            "area_source", "mesh_source"):
+        raise InvalidRayError(
+            "Invalid source_type '{}'. "
+            "Must be one of: grid, random, point_source, area_source, mesh_source".format(
+                source_type))
+
+    if source_type == "mesh_source" and mesh is None:
+        raise InvalidRayError(
+            "source_type='mesh_source' requires a 'mesh' argument")
+
+    if isinstance(polarization, str) and polarization not in ("s", "p", "random"):
+        raise InvalidRayError(
+            "polarization must be 's', 'p', 'random', or an angle in degrees. "
+            "Got '{}'".format(polarization))
+
+    # ---- 归一化主方向 ----
     main_dir = torch.tensor(direction, dtype=torch.float32, device=device)
-    main_dir = main_dir / torch.norm(main_dir)
+    dir_norm = torch.norm(main_dir)
+    if dir_norm < 1e-12:
+        raise InvalidRayError(
+            "direction must be a non-zero vector, got {}".format(direction))
+    main_dir = main_dir / dir_norm
     center_org = torch.tensor(origin, dtype=torch.float32, device=device)
 
-    ref_vec = torch.tensor([0.0, 0.0, 1.0], device=device) if torch.abs(main_dir[2]) < 0.999 \
-        else torch.tensor([0.0, 1.0, 0.0], device=device)
+    ref_vec = (torch.tensor([0.0, 0.0, 1.0], device=device)
+               if torch.abs(main_dir[2]) < 0.999
+               else torch.tensor([0.0, 1.0, 0.0], device=device))
     u_vec = torch.cross(ref_vec, main_dir, dim=-1)
     u_vec = u_vec / torch.norm(u_vec)
     v_vec = torch.cross(main_dir, u_vec, dim=-1)
 
+    # ---- 按类型生成 ----
     if source_type == "grid":
         side_len = int(math.sqrt(num_rays))
+        if side_len < 1:
+            raise InvalidRayError(
+                "num_rays={} too small for grid source".format(num_rays))
         num_rays = side_len * side_len
         if side_len == 1:
             x_coords = torch.tensor([(bounds[0] + bounds[1]) * 0.5],
@@ -51,28 +87,37 @@ def generate_rays(source_type="grid", num_rays=100, origin=(0, 0, 0),
             y_coords = torch.tensor([(bounds[2] + bounds[3]) * 0.5],
                                     dtype=torch.float32, device=device)
         else:
-            x_coords = torch.linspace(bounds[0], bounds[1], side_len, device=device)
-            y_coords = torch.linspace(bounds[2], bounds[3], side_len, device=device)
+            x_coords = torch.linspace(bounds[0], bounds[1], side_len,
+                                       device=device)
+            y_coords = torch.linspace(bounds[2], bounds[3], side_len,
+                                       device=device)
         grid_x, grid_y = torch.meshgrid(x_coords, y_coords, indexing="ij")
-        origins = center_org + grid_x.reshape(-1, 1) * u_vec + grid_y.reshape(-1, 1) * v_vec
+        origins = center_org + grid_x.reshape(-1, 1) * u_vec + \
+                  grid_y.reshape(-1, 1) * v_vec
         dirs = main_dir.unsqueeze(0).expand(num_rays, 3)
+
     elif source_type == "random":
         r_rand = radius * torch.sqrt(torch.rand(num_rays, 1, device=device))
         theta_rand = 2 * math.pi * torch.rand(num_rays, 1, device=device)
         origins = center_org + (r_rand * torch.cos(theta_rand)) * u_vec \
                   + (r_rand * torch.sin(theta_rand)) * v_vec
         dirs = main_dir.unsqueeze(0).expand(num_rays, 3)
+
     elif source_type == "point_source":
         origins = center_org.unsqueeze(0).expand(num_rays, 3)
         max_theta = math.radians(angle_deg)
-        cos_theta = 1 - torch.rand(num_rays, 1, device=device) * (1 - math.cos(max_theta))
+        cos_theta = 1 - torch.rand(num_rays, 1, device=device) * \
+                    (1 - math.cos(max_theta))
         sin_theta = torch.sqrt(1 - cos_theta ** 2)
         phi = 2 * math.pi * torch.rand(num_rays, 1, device=device)
         dirs = sin_theta * torch.cos(phi) * u_vec \
                + sin_theta * torch.sin(phi) * v_vec + cos_theta * main_dir
+
     elif source_type == "area_source":
-        rand_x = bounds[0] + (bounds[1] - bounds[0]) * torch.rand(num_rays, 1, device=device)
-        rand_y = bounds[2] + (bounds[3] - bounds[2]) * torch.rand(num_rays, 1, device=device)
+        rand_x = bounds[0] + (bounds[1] - bounds[0]) * \
+                 torch.rand(num_rays, 1, device=device)
+        rand_y = bounds[2] + (bounds[3] - bounds[2]) * \
+                 torch.rand(num_rays, 1, device=device)
         origins = center_org + rand_x * u_vec + rand_y * v_vec
         r_sq = torch.rand(num_rays, 1, device=device)
         sin_theta = torch.sqrt(r_sq)
@@ -80,8 +125,10 @@ def generate_rays(source_type="grid", num_rays=100, origin=(0, 0, 0),
         phi = 2 * math.pi * torch.rand(num_rays, 1, device=device)
         dirs = sin_theta * torch.cos(phi) * u_vec \
                + sin_theta * torch.sin(phi) * v_vec + cos_theta * main_dir
-    elif source_type == "mesh_source" and mesh is not None:
-        mesh_verts = torch.tensor(mesh.vertices, dtype=torch.float32, device=device)
+
+    elif source_type == "mesh_source":
+        mesh_verts = torch.tensor(mesh.vertices, dtype=torch.float32,
+                                   device=device)
         mesh_faces = torch.tensor(mesh.faces, dtype=torch.long, device=device)
         tris = mesh_verts[mesh_faces]
         e1 = tris[:, 1] - tris[:, 0]
@@ -92,7 +139,8 @@ def generate_rays(source_type="grid", num_rays=100, origin=(0, 0, 0),
         cdf = torch.cumsum(areas, dim=0)
         cdf = cdf / cdf[-1]
         rand_cdf = torch.rand(num_rays, device=device)
-        face_indices = torch.clamp(torch.searchsorted(cdf, rand_cdf), 0, mesh_faces.shape[0] - 1)
+        face_indices = torch.clamp(torch.searchsorted(cdf, rand_cdf),
+                                    0, mesh_faces.shape[0] - 1)
         r1 = torch.rand(num_rays, 1, device=device)
         r2 = torch.rand(num_rays, 1, device=device)
         sqrt_r1 = torch.sqrt(r1)
@@ -100,7 +148,8 @@ def generate_rays(source_type="grid", num_rays=100, origin=(0, 0, 0),
         v_bc = r2 * sqrt_r1
         w_bc = 1 - u_bc - v_bc
         selected_tris = tris[face_indices]
-        origins = u_bc * selected_tris[:, 0] + v_bc * selected_tris[:, 1] + w_bc * selected_tris[:, 2]
+        origins = (u_bc * selected_tris[:, 0] + v_bc * selected_tris[:, 1]
+                   + w_bc * selected_tris[:, 2])
         mesh_normals = normals[face_indices]
         r_sq = torch.rand(num_rays, 1, device=device)
         sin_theta = torch.sqrt(r_sq)
@@ -108,19 +157,19 @@ def generate_rays(source_type="grid", num_rays=100, origin=(0, 0, 0),
         phi = 2 * math.pi * torch.rand(num_rays, 1, device=device)
         ref = torch.zeros_like(mesh_normals)
         ref[:, 2] = 1.0
-        ref[torch.abs(mesh_normals[:, 2]) > 0.999] = torch.tensor([0.0, 1.0, 0.0], device=device)
+        ref[torch.abs(mesh_normals[:, 2]) > 0.999] = \
+            torch.tensor([0.0, 1.0, 0.0], device=device)
         local_u = torch.cross(ref, mesh_normals, dim=-1)
         local_u = local_u / torch.norm(local_u, dim=-1, keepdim=True)
         local_v = torch.cross(mesh_normals, local_u, dim=-1)
         dirs = sin_theta * torch.cos(phi) * local_u \
                + sin_theta * torch.sin(phi) * local_v + cos_theta * mesh_normals
-    else:
-        raise ValueError(f"Invalid source type: {source_type}")
 
     dirs = dirs / torch.norm(dirs, dim=-1, keepdim=True)
     wavelengths = torch.full((num_rays, 1), float(wavelength_nm),
-                             dtype=torch.float32, device=device)
+                              dtype=torch.float32, device=device)
 
+    # ---- Stokes 向量 ----
     stokes = torch.zeros((num_rays, 4), dtype=torch.float32, device=device)
     stokes[:, 0] = 1.0
     if polarization == "s":
@@ -130,21 +179,32 @@ def generate_rays(source_type="grid", num_rays=100, origin=(0, 0, 0),
     elif polarization == "random":
         pass
     else:
-        ang = float(polarization) if isinstance(polarization, (int, float)) else 0.0
+        try:
+            ang = float(polarization)
+        except (TypeError, ValueError):
+            raise InvalidRayError(
+                "polarization must be 's', 'p', 'random', or a number. "
+                "Got {!r}".format(polarization))
         stokes[:, 1] = math.cos(2 * math.radians(ang))
         stokes[:, 2] = math.sin(2 * math.radians(ang))
 
     s_ref = _choose_perpendicular(dirs)
     p_ref = torch.cross(dirs, s_ref, dim=-1)
 
-    # ★ 每条光线的初始介质 ID
+    # ---- medium_ids ----
     if isinstance(medium_id, (list, tuple)):
+        if len(medium_id) != num_rays:
+            raise InvalidRayError(
+                "medium_id list length ({}) must match num_rays ({})".format(
+                    len(medium_id), num_rays))
         medium_ids_t = torch.tensor(medium_id, dtype=torch.long, device=device)
-        assert medium_ids_t.shape[0] == num_rays, \
-            "medium_id list length must match num_rays"
+    elif isinstance(medium_id, int):
+        medium_ids_t = torch.full((num_rays,), medium_id,
+                                    dtype=torch.long, device=device)
     else:
-        medium_ids_t = torch.full((num_rays,), int(medium_id),
-                                   dtype=torch.long, device=device)
+        raise InvalidRayError(
+            "medium_id must be int or list of ints, got {!r}".format(
+                type(medium_id)))
 
     return {
         "origins": origins,

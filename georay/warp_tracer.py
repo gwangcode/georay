@@ -23,6 +23,7 @@ GRIN 场：
     * 3D dict-grid  三线性插值 + 解析梯度
     * 4D dict-grid  四线性插值 + 中心差分梯度
 """
+
 from __future__ import annotations
 
 import math
@@ -30,6 +31,8 @@ import numpy as np
 import torch
 import warp as wp
 import trimesh
+from .exceptions import BackendError, InvalidRayError
+from .tracer import _validate_materials_cfg, _validate_ray_dict
 
 
 # ==============================================================================
@@ -1316,15 +1319,14 @@ class WarpTracer:
 
     def __init__(self, vertices, faces, face_materials, materials_cfg, device,
                  grin_callable=None):
-        """
-        Args:
-            vertices, faces, face_materials: 网格数据。
-            materials_cfg: 材质配置 dict。
-            device: torch.device。
-            grin_callable: 可选，Python 函数 f(x, y, z) -> n。
-                支持标量或 numpy 数组输入。
-                在 __init__ 里被采样成 3D grid，之后走 grid 路径。
-        """
+        # ★ 验证材质配置（复用 PyTorch tracer 的验证器）
+        _validate_materials_cfg(materials_cfg, face_materials)
+
+        # ★ 检查 warp 是否可用
+        if not hasattr(wp, "init"):
+            raise BackendError(
+                "Warp not available. Install with: pip install warp-lang")
+
         self.device = device
         self.warp_device = "cuda:0" if str(device).startswith("cuda") else "cpu"
         self.grin_callable = grin_callable
@@ -1545,6 +1547,12 @@ class WarpTracer:
                 可选键 "medium_ids": [N] long tensor，每条光线的初始介质 ID。
             ...
         """
+
+        _validate_ray_dict(ray_dict)
+
+        if surface_model is None:
+            surface_model = "coated" if fresnel else "custom"
+
         if surface_model is None:
             surface_model = "coated" if fresnel else "custom"
         if surface_model not in ("fresnel", "custom", "coated"):

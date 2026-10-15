@@ -1,9 +1,11 @@
 """Main ray tracer class for GeoRay."""
 import math
 import torch
-import torch.nn as nn
 
 from .bvh import BVHMeshIntersector
+from .exceptions import (
+    ConfigurationError, InvalidMaterialError, InvalidRayError, GeometryError,
+)
 from .interpolation import create_pure_torch_interpolated_cfg
 from .grin import parse_grin_input_to_field
 from .integrator import adaptive_rk4_step_per_ray
@@ -18,9 +20,13 @@ from .polarization import (
 
 
 def _validate_materials_cfg(materials_cfg, face_materials):
-    """验证 materials_cfg 和 face_materials 的合法性。"""
+    """验证 materials_cfg 和 face_materials 的合法性。
+
+    Raises:
+        InvalidMaterialError: 配置不合法。
+    """
     if not isinstance(materials_cfg, dict) or len(materials_cfg) == 0:
-        raise ValueError(
+        raise InvalidMaterialError(
             "materials_cfg must be a non-empty dict, got {}".format(
                 type(materials_cfg)))
 
@@ -29,25 +35,27 @@ def _validate_materials_cfg(materials_cfg, face_materials):
         defined = set(materials_cfg.keys())
         missing = [m for m in unique_ids if m not in defined]
         if missing:
-            raise ValueError(
+            raise InvalidMaterialError(
                 "face_materials references undefined material IDs: {}. "
-                "Defined IDs: {}".format(sorted(missing), sorted(defined)))
+                "Defined IDs: {}. "
+                "Add these IDs to materials_cfg or fix face_materials.".format(
+                    sorted(missing), sorted(defined)))
 
     for mat_id, cfg in materials_cfg.items():
         if not isinstance(mat_id, int):
-            raise ValueError(
+            raise InvalidMaterialError(
                 "Material ID must be int, got {}: {}".format(
                     type(mat_id), mat_id))
 
         if not isinstance(cfg, dict):
-            raise ValueError(
+            raise InvalidMaterialError(
                 "materials_cfg[{}] must be a dict, got {}".format(
                     mat_id, type(cfg)))
 
         if "n" in cfg:
             n_val = cfg["n"]
             if isinstance(n_val, (int, float)) and n_val <= 0:
-                raise ValueError(
+                raise InvalidMaterialError(
                     "materials_cfg[{}]['n'] = {} must be > 0".format(
                         mat_id, n_val))
 
@@ -55,14 +63,14 @@ def _validate_materials_cfg(materials_cfg, face_materials):
             if field in cfg:
                 v = cfg[field]
                 if isinstance(v, (int, float)) and (v < 0.0 or v > 1.0):
-                    raise ValueError(
+                    raise InvalidMaterialError(
                         "materials_cfg[{}]['{}'] = {} must be in [0, 1]".format(
                             mat_id, field, v))
 
         if "grin_field" in cfg and cfg["grin_field"] is not None:
             gf = cfg["grin_field"]
             if not (isinstance(gf, dict) or callable(gf)):
-                raise ValueError(
+                raise InvalidMaterialError(
                     "materials_cfg[{}]['grin_field'] must be dict or callable, "
                     "got {}".format(mat_id, type(gf)))
 
@@ -70,19 +78,64 @@ def _validate_materials_cfg(materials_cfg, face_materials):
                 gtype = gf.get("type", "")
                 valid_types = ("parabolic", "grid", "grid_4d", "callable")
                 if gtype not in valid_types:
-                    raise ValueError(
+                    raise InvalidMaterialError(
                         "materials_cfg[{}]['grin_field']['type'] = '{}' "
-                        "must be one of {}".format(mat_id, gtype, valid_types))
+                        "must be one of {}".format(
+                            mat_id, gtype, valid_types))
 
                 if gtype == "parabolic":
                     if "n0" in gf and gf["n0"] <= 0:
-                        raise ValueError(
+                        raise InvalidMaterialError(
                             "materials_cfg[{}]['grin_field']['n0'] = {} "
                             "must be > 0".format(mat_id, gf["n0"]))
                     if "A" in gf and gf["A"] < 0:
-                        raise ValueError(
+                        raise InvalidMaterialError(
                             "materials_cfg[{}]['grin_field']['A'] = {} "
                             "must be >= 0".format(mat_id, gf["A"]))
+
+
+def _validate_ray_dict(ray_dict):
+    """验证 ray_dict 的合法性和形状一致性。
+
+    Raises:
+        InvalidRayError: ray_dict 缺失字段或 shape 不匹配。
+    """
+    required = ["origins", "dirs", "wavelengths", "stokes", "s_ref", "p_ref"]
+    missing = [k for k in required if k not in ray_dict]
+    if missing:
+        raise InvalidRayError(
+            "ray_dict missing required keys: {}. "
+            "Use generate_rays() to create a valid ray_dict.".format(missing))
+
+    N = ray_dict["origins"].shape[0]
+    if N == 0:
+        raise InvalidRayError("ray_dict contains 0 rays")
+
+    expected_shapes = {
+        "origins": (N, 3),
+        "dirs": (N, 3),
+        "wavelengths": (N, 1),
+        "stokes": (N, 4),
+        "s_ref": (N, 3),
+        "p_ref": (N, 3),
+    }
+    for k, expected in expected_shapes.items():
+        actual = tuple(ray_dict[k].shape)
+        if actual != expected:
+            raise InvalidRayError(
+                "ray_dict['{}'] shape is {}, expected {}".format(
+                    k, actual, expected))
+
+    if "medium_ids" in ray_dict:
+        mid = ray_dict["medium_ids"]
+        if not isinstance(mid, int):
+            if mid.shape[0] != N:
+                raise InvalidRayError(
+                    "ray_dict['medium_ids'] length {} "
+                    "does not match number of rays {}".format(
+                        mid.shape[0], N))
+
+    return N
 
 def _ray_box_exit_distance(origins, dirs, box_min, box_max, default_dist):
     """
@@ -215,8 +268,14 @@ class AdvancedRayTracerPBRTGPU:
     def trace(self, ray_dict, max_steps=50, ds_init=0.02, ds_min=1e-3,
               ds_max=0.1, rk_tol=1e-4, fresnel=True, verbose=False,
               surface_model=None, rr_threshold=0.0):
+        """...docstring..."""
+
+        # ★ 验证 ray_dict
+        _validate_ray_dict(ray_dict)
+
         if surface_model is None:
             surface_model = "coated" if fresnel else "custom"
+
         if surface_model not in ("fresnel", "custom", "coated"):
             raise ValueError(
                 "surface_model must be 'fresnel', 'custom', or 'coated', "

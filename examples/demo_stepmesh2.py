@@ -59,9 +59,9 @@ for f in STEP_FILES:
 print("\n[1/6] 调用 stepmesh.glue() 处理 STEP 文件...")
 
 try:
-    result = glue(STEP_FILES,  return_internal_surfaces=True)
+    result = glue(STEP_FILES)
 except TypeError:
-    result = glue(step_paths=STEP_FILES,  return_internal_surfaces=True)
+    result = glue(step_paths=STEP_FILES)
 
 if isinstance(result, dict):
     vertices = np.asarray(result["vertices"])
