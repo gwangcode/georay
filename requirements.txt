@@ -1,3 +1,31 @@
-torch>=2.0.0
-numpy>=1.21.0
-trimesh>=3.20.0
+# ==============================================================================
+# GeoRay — Full Dependency Set
+# ==============================================================================
+# Install everything in one go:
+#     pip install -r requirements.txt
+#
+# For a lighter setup, use one of these instead:
+#     pip install numpy torch                # core only
+#     pip install -e .                       # core only (via pyproject.toml)
+#     pip install -e ".[warp]"               # core + Warp GPU acceleration
+#     pip install -e ".[all]"                # core + all optional features
+# ==============================================================================
+
+# ---- Core ----
+numpy>=1.21
+torch>=2.0
+
+# ---- Mesh I/O (NPZ/STL export, trimesh mesh loading) ----
+trimesh>=3.20
+
+# ---- Warp GPU acceleration (full-kernel tracer, highly recommended) ----
+warp-lang>=1.0
+
+# ---- STEP mesh adapter (CAD file support) ----
+# stepmesh is not on PyPI; install from GitHub
+git+https://github.com/gwangcode/stepmesh
+
+# ---- Development tools (testing + linting) ----
+pytest>=7.0
+pytest-cov>=4.0
+ruff>=0.4
