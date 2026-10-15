@@ -5,17 +5,17 @@ import numpy as np
 def transfer_matrix_stack(wavelength_nm, theta_i_rad, n_list, d_list,
                            polarization="s"):
     """
-    计算多层薄膜的反射率 R 和透射率 T。
+    Compute reflectance R and transmittance T of a multilayer thin film stack.
 
     Args:
-        wavelength_nm: 真空波长 (nm)
-        theta_i_rad: 入射角 (弧度)
-        n_list: [n0, n1, ..., nN, n_sub] 各层折射率
-        d_list: [d1, ..., dN] 各层物理厚度 (nm)
-        polarization: "s" 或 "p"
+        wavelength_nm: vacuum wavelength (nm).
+        theta_i_rad: incidence angle (radians).
+        n_list: [n0, n1, ..., nN, n_sub] refractive indices of each layer.
+        d_list: [d1, ..., dN] physical thickness (nm) of each layer.
+        polarization: "s" or "p".
 
     Returns:
-        (R, T): 反射率、透射率
+        (R, T): reflectance and transmittance.
     """
     n = np.asarray(n_list, dtype=complex)
     d = np.asarray(d_list, dtype=float)
@@ -50,7 +50,7 @@ def transfer_matrix_stack(wavelength_nm, theta_i_rad, n_list, d_list,
 
 
 def quarter_wave_ar_coating(n_substrate=1.5, wavelength_nm=550.0):
-    """四分之一波长增透膜：n_coating = sqrt(n_substrate)。"""
+    """Quarter-wave anti-reflective coating: n_coating = sqrt(n_substrate)."""
     n_coating = float(np.sqrt(n_substrate))
     d = wavelength_nm / (4.0 * n_coating)
     return n_coating, d
