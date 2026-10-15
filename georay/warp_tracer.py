@@ -1536,9 +1536,9 @@ class WarpTracer:
             return
 
         raise NotImplementedError("Unrecognized property config: {}".format(cfg))
-
+    
     def trace(self, ray_dict, max_steps=50, ds_init=0.02, ds_min=1e-3,
-              ds_max=0.1, rk_tol=1e-4, fresnel=True, verbose=False,
+              ds_max=0.1, rk_tol=1e-4, fresnel=True,
               surface_model=None, rr_threshold=0.0, seed=42):
         """追踪光线。
 
